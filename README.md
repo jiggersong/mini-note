@@ -111,6 +111,25 @@ cd mini-note
 
 ---
 
+## OpenClaw Skill
+
+项目附带 `mini-note.skill.md`，加载到 OpenClaw 或 WorkBuddy 后，可以直接用自然语言操作：
+
+```
+你：「帮我把这份 PDF 记下来」
+AI：[调用 ./run.sh ingest ...] → 已摄入，生成了来源页和 3 条 claim。
+
+你：「之前关于 ECS 性能的笔记有哪些？」
+AI：[调用 ./run.sh query ...] → 找到 5 个页面和 8 条 claim，核心要点是...
+
+你：「笔记系统状态怎么样？」
+AI：[调用 health + lint + review list] → 目录正常，无断链，无积压审核任务，已创建备份。
+```
+
+Skill 文件定义了触发条件、命令映射、典型工作流和错误处理策略，AI 据此自动选择正确的 CLI 命令和参数。
+
+---
+
 ## CLI 命令速览
 
 | 命令 | 说明 |

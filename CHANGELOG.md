@@ -45,8 +45,13 @@
 - 11 个子命令：`init`、`health`、`lint`、`ingest`、`query`、`index`、`backup`、`restore`、`review`
 - 统一 JSON 输出（`--json`）
 - 标准错误格式（`ok`/`error_code`/`message`/`operation_id`/`retryable`）
+- 目录批量导入脚本（`import.sh`）
 
-### 测试
+### OpenClaw Skill
+- `mini-note.skill.md` — OpenClaw/WorkBuddy Skill 定义文件
+- 自然语言触发：记笔记、查笔记、健康检查、审核、备份
+- 三个典型工作流：摄入→检查→审核、深度查询、定期维护
+- AI 自动选择 CLI 命令和参数，解析 JSON 结果合成回复
 - 233 个测试用例（单元 + 集成）
 - OSS 云端测试自动 skip（无凭证时）
 - pytest fixtures 隔离，临时 workspace 独立运行
