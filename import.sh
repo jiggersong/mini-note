@@ -19,7 +19,6 @@ usage() {
     echo "  --owner ID      文件归属（默认 user-default）"
     echo "  --scope SCOPE   可见范围 shared/private（默认 shared）"
     echo "  --dry-run       仅列出文件，不执行导入"
-    echo "  --cleanup       导入成功后删除来源文件"
     echo "  --help          显示帮助"
     echo ""
     echo "示例:"
@@ -34,7 +33,6 @@ cd "$SCRIPT_DIR"
 
 # 参数解析
 DRY_RUN=false
-CLEANUP=false
 OWNER="user-default"
 SCOPE="shared"
 SRC_DIR=""
@@ -43,7 +41,6 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h) usage ;;
         --dry-run) DRY_RUN=true; shift ;;
-        --cleanup) CLEANUP=true; shift ;;
         --owner) OWNER="$2"; shift 2 ;;
         --scope) SCOPE="$2"; shift 2 ;;
         -*) echo -e "${RED}未知选项: $1${NC}"; exit 1 ;;
@@ -72,7 +69,6 @@ FILE_COUNT=0
 TOTAL_SIZE=0
 while IFS= read -r -d '' f; do
     name=$(basename "$f")
-    # 跳过隐藏文件和 .gitkeep
     [[ "$name" == .* ]] && continue
     [[ "$name" == ".gitkeep" ]] && continue
     FILE_COUNT=$((FILE_COUNT + 1))
@@ -102,7 +98,7 @@ if [ "$DRY_RUN" = true ]; then
     echo "--- 文件列表（仅预览） ---"
     find "$SRC_DIR" -type f -not -name ".*" -not -name ".gitkeep" -exec ls -lh {} \;
     echo ""
-    echo "使用 --dry-run 模式，未执行导入。"
+    echo "--dry-run 模式，未执行导入。"
     exit 0
 fi
 
@@ -143,20 +139,6 @@ PYTHONPATH="$SCRIPT_DIR/src" python3 -m mini_note.cli ingest \
     --owner "$OWNER" \
     --scope "$SCOPE" \
     --json
-
-# 清理来源文件（可选）
-if [ "$CLEANUP" = true ]; then
-    echo ""
-    echo "--- 清理来源文件 ---"
-    while IFS= read -r -d '' f; do
-        name=$(basename "$f")
-        [[ "$name" == .* ]] && continue
-        [[ "$name" == ".gitkeep" ]] && continue
-        rm "$f"
-        echo "  已删除: $f"
-    done < <(find "$SRC_DIR" -type f -print0)
-    echo "来源目录已清空。"
-fi
 
 echo ""
 echo -e "${GREEN}✅ 导入完成${NC}"

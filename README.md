@@ -62,6 +62,12 @@ cd mini-note
 # 批量导入已有目录
 ./import.sh ~/Documents/notes
 
+# 预览目录文件（不执行导入）
+./import.sh ~/Documents/notes --dry-run
+
+# 指定归属和可见范围
+./import.sh ~/Downloads/project-docs --owner alice --scope private
+
 # 摄入单个文件
 ./run.sh ingest --file doc.xlsx --owner user-default --scope shared
 
@@ -86,10 +92,30 @@ cd mini-note
 
 ---
 
+## 批量导入
+
+`import.sh` 用于将已有目录中的文件一次性导入知识库：
+
+```bash
+# 基本用法
+./import.sh <目录路径>
+
+# 选项
+./import.sh ~/Documents/notes                    # 直接导入
+./import.sh ~/Documents/notes --dry-run          # 预览，不导入
+./import.sh ~/Documents/notes --owner alice      # 指定归属人
+./import.sh ~/Documents/notes --scope private    # 指定可见范围
+```
+
+脚本流程：扫描目录 → 列出文件清单（含总大小）→ 复制到 `raw/inbox/users/` → 调用 `ingest --scan-inbox` 批量摄入。来源目录文件不会被修改或删除。
+
+---
+
 ## CLI 命令速览
 
 | 命令 | 说明 |
 |------|------|
+| `./import.sh DIR` | 批量导入已有目录 |
 | `init --workspace PATH` | 初始化知识库目录 |
 | `ingest --file PATH` | 摄入文件，生成 Wiki 页面和 claim |
 | `ingest --scan-inbox` | 批量摄入 inbox 目录 |

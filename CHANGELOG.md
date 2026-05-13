@@ -22,6 +22,7 @@
 - 代码（Python AST 结构化提取，通用语言 regex fallback）
 - 音视频（mutagen 元数据标签提取）
 - 批量摄入（`--scan-inbox` 扫描 inbox 目录）
+- 目录批量导入（`import.sh` 一键导入已有目录）
 
 ### 知识检索
 - SQLite FTS5 全文检索 + 中文 bigram 分词
