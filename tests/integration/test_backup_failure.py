@@ -29,8 +29,8 @@ class TestBackupFailure:
         source_page = tmp_workspace / "wiki" / "sources" / f"{result.source_id}.md"
         assert source_page.exists()
 
-    def test_operation_manifest_shows_backup_status(self, tmp_workspace, sample_md_file):
-        """Operation manifest 明确显示备份状态。"""
+    def test_operation_manifest_shows_status_indexed(self, tmp_workspace, sample_md_file):
+        """Ingest 完成后 operation manifest 状态为 indexed。"""
         from mini_note.ingest.pipeline import IngestPipeline
         import yaml
 
@@ -47,10 +47,7 @@ class TestBackupFailure:
         if manifest_path.exists():
             data = yaml.safe_load(manifest_path.read_text())
             assert "status" in data
-            # status 应该是 applied、indexed、backed_up 或 failed
-            assert data["status"] in (
-                "planned", "staged", "applied", "indexed", "backed_up", "failed"
-            )
+            assert data["status"] == "indexed"
 
     def test_backup_failure_marked_pending(self, tmp_workspace, sample_md_file):
         """备份失败后 backup status 标记为 pending。"""

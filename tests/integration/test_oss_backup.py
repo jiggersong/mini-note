@@ -237,7 +237,7 @@ class TestOSSCLILocal:
     """无 OSS 配置或 OSS 不可写时 CLI 的备份恢复行为。"""
 
     def test_backup_create_local_mode(self, tmp_workspace):
-        """backup create 至少创建本地快照。"""
+        """backup create 无 OSS 时跳过。"""
         from mini_note.cli import main
 
         main(["init", "--workspace", str(tmp_workspace)])
@@ -247,23 +247,20 @@ class TestOSSCLILocal:
             "--reason", "local-test",
             "--json",
         ])
-        assert result["snapshot_id"] != ""
-        assert result["sha256"] != ""
+        assert result["ok"] is True
+        assert result.get("skipped") is True
 
     def test_restore_verify_local_snapshot(self, tmp_workspace):
         """restore verify 用本地文件路径做恢复演练。"""
         from mini_note.cli import main
+        from mini_note.backup.snapshot import create_snapshot
 
         main(["init", "--workspace", str(tmp_workspace)])
 
-        backup_result = main([
-            "backup", "create",
-            "--workspace", str(tmp_workspace),
-            "--reason", "local-restore-test",
-            "--json",
-        ])
-        snapshot_id = backup_result["snapshot_id"]
-        snapshot_path = tmp_workspace / ".state" / "staging" / f"{snapshot_id}.tar.gz"
+        # 手动创建快照（不再通过 backup create）
+        snapshot_path = tmp_workspace / ".state" / "staging" / "test-restore.tar.gz"
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        create_snapshot(tmp_workspace, snapshot_path, compression="gzip")
 
         result = main([
             "restore", "verify",
@@ -301,57 +298,18 @@ class TestOSSCLILocal:
         assert result["ok"] is False
         assert result["error_code"] == "MISSING_SNAPSHOT"
 
-    def test_local_mode_keeps_at_most_5_snapshots(self, tmp_workspace):
-        """本地模式 backup create 只保留最近 5 个 tar.gz。"""
-        from mini_note.cli import main
+    def test_local_mode_prunes_to_7_snapshots(self, tmp_workspace):
+        """_prune_staging_snapshots 保留最多 7 个 tar.gz。"""
+        from mini_note.cli import _prune_staging_snapshots
 
-        main(["init", "--workspace", str(tmp_workspace)])
         staging = tmp_workspace / ".state" / "staging"
-        for i in range(8):
-            main(["backup", "create", "--workspace", str(tmp_workspace), "--reason", f"test-{i}", "--json"])
-
-        tars = list(staging.glob("*.tar.gz"))
-        assert len(tars) <= 5, f"本地模式应最多保留 5 个快照，实际 {len(tars)}"
-
-    def test_keep_local_writes_to_backups_not_staging(self, tmp_workspace):
-        """--keep-local 快照写入 .state/backups/，不被 prune 误删。"""
-        from mini_note.cli import main
-
-        main(["init", "--workspace", str(tmp_workspace)])
-        result = main([
-            "backup", "create",
-            "--workspace", str(tmp_workspace),
-            "--reason", "keep-test",
-            "--keep-local",
-            "--json",
-        ])
-        local_path = Path(result["local_path"])
-        backups_dir = tmp_workspace / ".state" / "backups"
-        assert backups_dir in local_path.parents
-        assert local_path.exists()
-
-    def test_keep_local_survives_prune(self, tmp_workspace):
-        """--keep-local 快照不被后续 backup 的 prune 删除。"""
-        from mini_note.cli import main
-
-        main(["init", "--workspace", str(tmp_workspace)])
-
-        # 创建一个 keep-local 快照
-        kept = main([
-            "backup", "create",
-            "--workspace", str(tmp_workspace),
-            "--reason", "keep-me",
-            "--keep-local",
-            "--json",
-        ])
-        kept_path = Path(kept["local_path"])
-
-        # 创建多个普通备份触发 prune
+        staging.mkdir(parents=True, exist_ok=True)
         for i in range(10):
-            main(["backup", "create", "--workspace", str(tmp_workspace), "--reason", f"prune-{i}", "--json"])
+            (staging / f"snap-20260101-{i:06d}-abcd.tar.gz").write_bytes(b"fake")
 
-        # keep-local 的快照应该还在
-        assert kept_path.exists(), "--keep-local 快照不应被后续 prune 删除"
+        _prune_staging_snapshots(tmp_workspace, keep=7)
+        tars = list(staging.glob("*.tar.gz"))
+        assert len(tars) <= 7, f"应最多保留 7 个快照，实际 {len(tars)}"
 
     def test_maintenance_cleanup_removes_old_snapshots(self, tmp_workspace):
         """maintenance cleanup 清理过期快照。"""

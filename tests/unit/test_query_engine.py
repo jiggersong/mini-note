@@ -106,17 +106,20 @@ ECS 突发性能实例适合低负载场景。
         assert result["pages"] == [] or len(result["pages"]) >= 0
 
     def test_query_empty_question(self, tmp_workspace):
-        """空查询问题不崩溃。"""
+        """空查询问题返回结构化错误。"""
         from mini_note.query.engine import QueryEngine
 
         engine = QueryEngine(tmp_workspace)
-        with pytest.raises(ValueError):
-            engine.search("", scope="shared")
+        result = engine.search("", scope="shared")
+        assert result["ok"] is False
+        assert result["error_code"] == "EMPTY_QUESTION"
+        assert result["pages"] == []
 
     def test_query_whitespace_question(self, tmp_workspace):
-        """纯空白查询问题不崩溃。"""
+        """纯空白查询问题返回结构化错误。"""
         from mini_note.query.engine import QueryEngine
 
         engine = QueryEngine(tmp_workspace)
-        with pytest.raises(ValueError):
-            engine.search("   ", scope="shared")
+        result = engine.search("   ", scope="shared")
+        assert result["ok"] is False
+        assert result["error_code"] == "EMPTY_QUESTION"

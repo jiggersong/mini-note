@@ -77,6 +77,9 @@ class LintEngine:
                 for i, line in enumerate(lines, 1):
                     for m in wikilink_re.finditer(line):
                         target = m.group(1).strip()
+                        # claim: 前缀是虚拟引用，不解析为文件路径
+                        if target.startswith("claim:"):
+                            continue
                         target_path = self.workspace / target
                         if not target_path.exists():
                             broken.append({

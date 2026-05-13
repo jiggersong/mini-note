@@ -92,8 +92,8 @@ class SourceRegistry:
 
         return source_id
 
-    def _find_by_sha256(self, sha: str) -> str | None:
-        """扫描所有 source.yaml，查找重复 SHA256。"""
+    def find_by_sha256(self, sha: str) -> str | None:
+        """扫描所有 source.yaml，查找重复 SHA256（公开方法）。"""
         if not self.archive_dir.exists():
             return None
         for source_yaml in self.archive_dir.glob("*/source.yaml"):
@@ -104,6 +104,10 @@ class SourceRegistry:
             except Exception:
                 continue
         return None
+
+    def _find_by_sha256(self, sha: str) -> str | None:
+        """内部别名，保持兼容。"""
+        return self.find_by_sha256(sha)
 
     def _guess_media_type(self, ext: str) -> str:
         """根据扩展名推断 media type。"""

@@ -1,6 +1,5 @@
 """Ingest Pipeline — 摄入文件的全流程编排（CLI 的确定性部分）。"""
 
-import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -13,7 +12,6 @@ from mini_note.models.claim import Claim
 from mini_note.ingest.extraction import extract_by_type
 from mini_note.ingest.staging import write_to_staging, apply_staged_changes
 from mini_note.indexer import Indexer
-from mini_note.backup.snapshot import create_snapshot
 
 CST = timezone(timedelta(hours=8))
 
@@ -84,12 +82,25 @@ class IngestPipeline:
                     retryable=False,
                 )
 
-            # 2. Register source
-            registry = SourceRegistry(self.workspace)
-            source_id = registry.register(file_path, owner_id=owner_id, scope=scope)
+            # 2. 检查重复 — SHA256 已存在则跳过提取与 wiki 生成
             sha = compute_sha256(file_path)
+            registry = SourceRegistry(self.workspace)
+            existing_id = registry.find_by_sha256(sha)
+            if existing_id:
+                _release_lock(self.workspace)
+                return IngestResult(
+                    ok=True,
+                    operation_id=operation_id,
+                    source_id=existing_id,
+                    ingestion_status="full",
+                    backup_status="none",
+                    message="文件已存在，跳过重复摄入",
+                )
 
-            # 3. Extract content
+            # 3. Register source
+            source_id = registry.register(file_path, owner_id=owner_id, scope=scope)
+
+            # 4. Extract content
             ext_result = extract_by_type(file_path)
 
             # 写入 extracted 目录
@@ -138,46 +149,14 @@ class IngestPipeline:
             if not health["ok"]:
                 raise RuntimeError("Health check 失败: " + str(health["checks"]))
 
-            # 11. Create local snapshot
-            snapshot_path = self.workspace / ".state" / "staging" / f"{operation_id}.tar.gz"
-            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-            snapshot_sha = create_snapshot(self.workspace, snapshot_path, compression="gzip")
-
-            # 12. OSS upload — 有配置就必须上传，否则如实记录状态
-            oss_ok = False
-            oss_error = None
-            try:
-                from mini_note.backup.oss import OSSBackup
-                oss = OSSBackup()
-                if oss.enabled:
-                    oss_result = oss.upload(snapshot_path, operation_id)
-                    oss_ok = oss_result.get("ok", False)
-                    if not oss_ok:
-                        oss_error = oss_result.get("error")
-            except Exception as e:
-                oss_error = str(e)
-
-            if oss_ok:
-                backup_status = "backed_up"
-                # OSS 上传成功，清理本地临时快照
-                snapshot_path.unlink(missing_ok=True)
-            elif oss_error:
-                backup_status = "backup_failed"
-                # 上传失败，保留本地快照作为 fallback，但只保留最近 3 个
-                _prune_staging_snapshots(self.workspace, keep=3)
-            else:
-                backup_status = "indexed"
-                # 无 OSS 配置，本地快照即为唯一备份，保留但限制数量
-                _prune_staging_snapshots(self.workspace, keep=5)
-
-            # 13. Emit review tasks (MVP: 简化)
+            # 11. Emit review tasks (MVP: 简化)
             # 如有冲突 claim 则生成 review task
 
             # 记录 operation manifest
             op = OperationManifest(
                 operation_id=operation_id,
                 type="ingest",
-                status=backup_status,
+                status="indexed",
                 source_ids=[source_id],
                 planned_changes=[
                     {"action": "create_page", "path": source_page_rel},
@@ -203,7 +182,7 @@ class IngestPipeline:
                 operation_id=operation_id,
                 source_id=source_id,
                 ingestion_status=ext_result.status,
-                backup_status=backup_status,
+                backup_status="none",
                 source_page_path=source_page_rel,
             )
 
@@ -229,29 +208,26 @@ def _gen_operation_id() -> str:
 
 
 def _acquire_lock(workspace: Path) -> None:
+    """用 O_CREAT|O_EXCL 原子创建锁文件，避免检查-then-写入竞态。"""
+    import os
+
     lock_file = workspace / ".state" / "ingest.lock"
     lock_file.parent.mkdir(parents=True, exist_ok=True)
-    # MVP: 简单文件锁
-    if lock_file.exists():
-        # 检查超时
+
+    try:
+        fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, b"locked")
+        os.close(fd)
+    except FileExistsError:
+        # 锁已存在，检查是否超时（> 5 分钟自动释放）
         age = datetime.now().timestamp() - lock_file.stat().st_mtime
         if age < 300:
             raise RuntimeError("已有 ingest 操作正在执行")
-    lock_file.write_text("locked")
-
-
-def _prune_staging_snapshots(workspace: Path, keep: int) -> None:
-    """清理 .state/staging/ 中的旧快照，只保留最近 keep 个 .tar.gz。"""
-    staging = workspace / ".state" / "staging"
-    if not staging.exists():
-        return
-    tars = sorted(
-        staging.glob("*.tar.gz"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    for old in tars[keep:]:
-        old.unlink(missing_ok=True)
+        # 超时，强制获取
+        os.remove(lock_file)
+        fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, b"locked")
+        os.close(fd)
 
 
 def _release_lock(workspace: Path) -> None:
@@ -261,10 +237,10 @@ def _release_lock(workspace: Path) -> None:
 
 
 def _build_claims(source_id: str, content: str, ext: str) -> list[dict]:
-    """从解析内容中提取基础 claim（简单的启发式方法）。
+    """从解析内容中提取基础 claim（启发式占位，待 Skill 补全）。
 
-    MVP 阶段：提取包含数字、百分比、关键动词的句子作为候选 claim。
-    完整 claim 提取由 LLM (Skill 侧) 完成。
+    MVP 阶段：提取包含数字的句子作为候选 claim，quote_hash 为空。
+    完整 claim 提取（含原文 hash、精确定位）由 LLM (Skill 侧) 完成。
     """
     import re
 
@@ -286,7 +262,7 @@ def _build_claims(source_id: str, content: str, ext: str) -> list[dict]:
                 "source_id": source_id,
                 "text": sent[:200],
                 "locator": f"content paragraph={idx}",
-                "quote_hash": "",
+                "quote_hash": "",  # 启发式占位，待 Skill 计算原文 SHA256
                 "extraction_method": "heuristic" if ext in (".md", ".txt") else "extractor",
                 "confidence": 0.6,
                 "status": "unverified",

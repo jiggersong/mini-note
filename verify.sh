@@ -86,7 +86,7 @@ echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0
 
 # backup create
 RESULT=$(python3 -m mini_note.cli backup create --workspace "$TMP_WS" --reason verify --json 2>&1) || true
-echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get('sha256') else 1)" 2>/dev/null && \
+echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get('ok') else 1)" 2>/dev/null && \
     pass "backup  创建备份" || fail "backup" "创建失败"
 
 # restore verify

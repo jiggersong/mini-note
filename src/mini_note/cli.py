@@ -6,8 +6,11 @@
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
+
+logger = logging.getLogger("mini_note")
 
 
 def _error_result(
@@ -83,7 +86,6 @@ def main(argv: list[str] | None = None) -> dict | list:
     backup_create = backup_sp.add_parser("create", help="创建备份")
     backup_create.add_argument("--workspace", type=Path, default=Path.cwd())
     backup_create.add_argument("--reason", type=str, default="manual")
-    backup_create.add_argument("--keep-local", action="store_true", default=False)
     backup_create.add_argument("--json", action="store_true", default=False)
 
     # restore
@@ -147,10 +149,19 @@ def main(argv: list[str] | None = None) -> dict | list:
             message=f"CLI 参数错误 (exit={e.code})",
             retryable=False,
         )
+    except (ValueError, FileNotFoundError, OSError) as e:
+        # 已知的输入/IO 错误，不可重试
+        return _error_result(
+            error_code="INVALID_INPUT",
+            message=str(e),
+            retryable=False,
+        )
     except Exception as e:
+        # 未知编程错误，记录完整栈以便排查，不向调用方暴露内部细节
+        logger.error("未预期错误", exc_info=True)
         return _error_result(
             error_code="INTERNAL_ERROR",
-            message=str(e),
+            message=f"内部错误: {type(e).__name__}",
             retryable=True,
         )
 
@@ -184,6 +195,24 @@ def _dispatch(args: argparse.Namespace) -> dict | list:
             message=f"未知命令: {cmd}",
             retryable=False,
         )
+
+
+# ================================================================
+# 内部辅助函数
+# ================================================================
+
+def _prune_staging_snapshots(workspace: Path, keep: int) -> None:
+    """清理 .state/staging/ 中的旧快照，只保留最近 keep 个 .tar.gz。"""
+    staging = workspace / ".state" / "staging"
+    if not staging.exists():
+        return
+    tars = sorted(
+        staging.glob("*.tar.gz"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for old in tars[keep:]:
+        old.unlink(missing_ok=True)
 
 
 # ================================================================
@@ -332,66 +361,51 @@ def _cmd_backup(args: argparse.Namespace) -> dict:
         from datetime import datetime, timezone, timedelta
         from mini_note.backup.snapshot import create_snapshot
         from mini_note.backup.status import BackupLog
-        from mini_note.ingest.pipeline import _prune_staging_snapshots
         import secrets
 
         ws: Path = args.workspace
-        now = datetime.now(timezone(timedelta(hours=8)))
-        snapshot_id = f"snap-{now.strftime('%Y%m%d')}-{now.strftime('%H%M%S')}-{secrets.token_hex(4)}"
-        keep_local = getattr(args, "keep_local", False)
 
-        # --keep-local 写入专用备份目录，避免被 staging prune 误删
-        if keep_local:
-            snapshot_dir = ws / ".state" / "backups"
-            snapshot_path = snapshot_dir / f"{snapshot_id}.tar.gz"
-        else:
-            snapshot_dir = ws / ".state" / "staging"
-            snapshot_path = snapshot_dir / f"{snapshot_id}.tar.gz"
-        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-
-        sha = create_snapshot(ws, snapshot_path, compression="gzip")
-
-        # OSS 上传（如已配置）
-        oss_result = None
+        # 检测 OSS 配置，无 OSS 则跳过备份
         oss_configured = False
         try:
             from mini_note.backup.oss import OSSBackup
             oss = OSSBackup()
-            if oss.enabled:
-                oss_configured = True
-                oss_result = oss.upload(snapshot_path, snapshot_id)
+            oss_configured = oss.enabled
+        except Exception:
+            pass
+
+        if not oss_configured:
+            return {
+                "ok": True,
+                "mode": "local",
+                "skipped": True,
+                "message": "OSS 未配置，跳过备份",
+            }
+
+        # 有 OSS，创建快照并上传
+        now = datetime.now(timezone(timedelta(hours=8)))
+        snapshot_id = f"snap-{now.strftime('%Y%m%d')}-{now.strftime('%H%M%S')}-{secrets.token_hex(4)}"
+
+        snapshot_dir = ws / ".state" / "staging"
+        snapshot_path = snapshot_dir / f"{snapshot_id}.tar.gz"
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+
+        sha = create_snapshot(ws, snapshot_path, compression="gzip")
+
+        # OSS 上传
+        oss_result = None
+        try:
+            oss_result = oss.upload(snapshot_path, snapshot_id)
         except Exception:
             oss_result = {"ok": False, "error": "OSS 上传异常"}
 
         oss_ok = oss_result.get("ok", False) if oss_result else False
         oss_key = oss_result.get("oss_key", "") if oss_result else ""
-        mode = "oss" if oss_configured else "local"
 
-        # 快照生命周期
-        if oss_configured and oss_ok and not keep_local:
-            # OSS 上传成功，本地临时包已完成使命，删除
-            snapshot_path.unlink(missing_ok=True)
-            local_path = None
-        elif oss_configured and not oss_ok:
-            # OSS 上传失败，保留本地包作为 fallback，只保留最近 3 个
-            if not keep_local:
-                _prune_staging_snapshots(ws, keep=3)
-            local_path = str(snapshot_path)
-        elif not oss_configured and not keep_local:
-            # 无 OSS，本地包即唯一备份，保留最近 5 个
-            _prune_staging_snapshots(ws, keep=5)
-            local_path = str(snapshot_path)
-        else:
-            local_path = str(snapshot_path)
+        # 保留最近 7 个本地快照作为 fallback
+        _prune_staging_snapshots(ws, keep=7)
 
-        # 日志状态
-        if oss_configured and oss_ok:
-            log_status = "success"
-        elif oss_configured and not oss_ok:
-            log_status = "failed"
-        else:
-            log_status = "local_created"
-
+        log_status = "success" if oss_ok else "failed"
         log = BackupLog(ws / ".state" / "backup_log.jsonl")
         log.record(
             oss_object=oss_key or snapshot_id,
@@ -401,19 +415,19 @@ def _cmd_backup(args: argparse.Namespace) -> dict:
             error=None if oss_ok else (oss_result.get("error") if oss_result else None),
         )
 
-        result = {
+        result: dict = {
             "ok": True,
-            "mode": mode,
+            "mode": "oss",
             "snapshot_id": snapshot_id,
             "sha256": sha,
             "oss_ok": oss_ok,
+            "local_path": str(snapshot_path),
             "reason": args.reason,
         }
         if oss_key:
             result["oss_key"] = oss_key
-        if local_path:
-            result["local_path"] = local_path
         return result
+
     return _error_result(
         error_code="UNKNOWN_COMMAND",
         message=f"未知 backup 子命令: {args.backup_command}",
@@ -521,7 +535,6 @@ def _cmd_review(args: argparse.Namespace) -> dict | list:
 def _cmd_maintenance(args: argparse.Namespace) -> dict:
     if args.maintenance_command == "cleanup":
         from shutil import rmtree
-        from mini_note.ingest.pipeline import _prune_staging_snapshots
 
         ws: Path = args.workspace
         staging = ws / ".state" / "staging"

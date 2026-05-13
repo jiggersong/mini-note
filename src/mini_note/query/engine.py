@@ -16,9 +16,19 @@ class QueryEngine:
         self.workspace = workspace
 
     def search(self, question: str, scope: str = "shared") -> dict:
-        """检索知识库，返回结构化 JSON 素材。"""
+        """检索知识库，返回结构化 JSON 素材。
+
+        空输入不抛异常，返回 ok: false + error_code，便于 CLI/OpenClaw 解析。
+        """
         if not question or not question.strip():
-            raise ValueError("查询问题不能为空")
+            return {
+                "ok": False,
+                "error_code": "EMPTY_QUESTION",
+                "message": "查询问题不能为空",
+                "pages": [],
+                "claims": [],
+                "question": "",
+            }
 
         pages = self._search_pages_fts(question, scope)
         if pages is None:
@@ -29,6 +39,7 @@ class QueryEngine:
             claims = self._search_claims_fallback(question)
 
         return {
+            "ok": True,
             "pages": pages,
             "claims": claims,
             "question": question.strip(),

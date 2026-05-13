@@ -234,7 +234,9 @@ class OSSBackup:
         """
         import tempfile
 
-        tmp = Path(tempfile.mktemp(suffix=".tar.gz"))
+        fd, tmp_name = tempfile.mkstemp(suffix=".tar.gz")
+        os.close(fd)
+        tmp = Path(tmp_name)
         try:
             result = self.download(oss_key, tmp)
             if not result["ok"]:

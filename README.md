@@ -236,7 +236,7 @@ PYTHONPATH=src python -m pytest tests/ -v
 ./verify.sh
 ```
 
-当前测试：233 passed, 10 skipped（OSS 云端测试需配置凭证）
+当前测试：244 passed, 10 skipped（OSS 云端测试需配置凭证）
 
 ---
 
