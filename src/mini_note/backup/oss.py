@@ -113,7 +113,7 @@ class OSSBackup:
             bucket = self._get_client()
 
             if self.config.encryption_key:
-                # 加密需全量读入内存（AES-GCM 不支持流式）
+                # [RISK WARNING] AES-GCM 需整文件读入内存加密，500MB+ 快照可能 OOM
                 data = snapshot_path.read_bytes()
                 data = _aes_encrypt(data, self.config.encryption_key)
                 bucket.put_object(oss_key, data)
@@ -160,16 +160,27 @@ class OSSBackup:
         try:
             bucket = self._get_client()
             result = bucket.get_object(oss_key)
-            data = result.read()
-
-            # 可选：解密
-            if self.config.encryption_key:
-                data = _aes_decrypt(data, self.config.encryption_key)
-
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
 
-            sha = _sha256_data(data)
+            if self.config.encryption_key:
+                # [RISK WARNING] AES-GCM 需整文件读入内存解密，500MB+ 快照可能 OOM
+                data = result.read()
+                data = _aes_decrypt(data, self.config.encryption_key)
+                target.write_bytes(data)
+                sha = _sha256_data(data)
+            else:
+                # 流式下载 + 分块 hash，大文件不 OOM
+                tmp = target.with_suffix(target.suffix + ".tmp")
+                h = hashlib.sha256()
+                with open(tmp, "wb") as wf:
+                    while chunk := result.read(1 << 20):
+                        h.update(chunk)
+                        wf.write(chunk)
+                    wf.flush()
+                    os.fsync(wf.fileno())
+                os.replace(tmp, target)
+                sha = h.hexdigest()
+
             return {
                 "ok": True,
                 "path": str(target),
@@ -247,9 +258,13 @@ class OSSBackup:
 # 辅助函数
 # ================================================================
 
-def _sha256_file(path: Path) -> str:
-    """计算文件的 SHA256 hex 值。"""
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
+    """分块计算文件 SHA256，避免大文件 OOM。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(chunk_size):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _sha256_data(data: bytes) -> str:

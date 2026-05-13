@@ -160,7 +160,7 @@ class FTSIndex:
                 rows,
             )
 
-    def search_pages(self, question: str, scope: str = "shared", limit: int = 10) -> list[dict]:
+    def search_pages(self, question: str, scope: str = "shared", limit: int = 10, offset: int = 0) -> list[dict]:
         """FTS5 搜索页面，返回 rank 排序结果。"""
         query = tokenize_query(question)
         if not query.strip():
@@ -177,9 +177,9 @@ class FTSIndex:
                 FROM fts_pages
                 WHERE fts_pages MATCH ?
                 ORDER BY rank
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (query, limit),
+                (query, limit, offset),
             )
             results = []
             for row in cur:

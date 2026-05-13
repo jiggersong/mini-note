@@ -45,7 +45,11 @@ class QueryEngine:
     # ================================================================
 
     def _search_pages_fts(self, question: str, scope: str) -> list[dict] | None:
-        """FTS5 页面搜索，失败返回 None 以触发回退。"""
+        """FTS5 页面搜索，失败返回 None 以触发回退。
+
+        通过分页循环拉取 FTS 结果并 scope 过滤，确保 target scope
+        命中不在前 N 条时也不会丢失结果。
+        """
         try:
             from mini_note.indexer.fts import FTSIndex
         except ImportError:
@@ -53,41 +57,50 @@ class QueryEngine:
 
         fts = FTSIndex(self.workspace)
         target_limit = 10
-        raw = fts.search_pages(question, limit=target_limit * 3)
-        if not raw:
-            return None  # 可能 FTS 表不存在
+        page_size = 20
+        results: list[dict] = []
+        offset = 0
 
-        # 补充 frontmatter 信息 + scope 过滤
-        results = []
-        for item in raw:
-            page_path = self.workspace / item["path"]
-            fm = {}
-            if page_path.exists():
-                try:
-                    text = page_path.read_text(encoding="utf-8")
-                    fm = self._parse_frontmatter(text)
-                except Exception:
-                    pass
+        while len(results) < target_limit:
+            raw = fts.search_pages(question, limit=page_size, offset=offset)
+            if not raw:
+                break  # 可能 FTS 表不存在或已耗尽
 
-            page_scope = fm.get("scope", "shared")
-            # 与 fallback 路径一致的 scope 过滤逻辑
-            if scope != "shared" and page_scope != scope:
-                continue
+            for item in raw:
+                page_path = self.workspace / item["path"]
+                fm = {}
+                if page_path.exists():
+                    try:
+                        text = page_path.read_text(encoding="utf-8")
+                        fm = self._parse_frontmatter(text)
+                    except Exception:
+                        pass
 
-            results.append({
-                "page_id": item.get("page_id", ""),
-                "path": item["path"],
-                "title": item.get("title", ""),
-                "type": fm.get("type", ""),
-                "scope": page_scope,
-                "relevance": round(item.get("rank", 0), 4),
-                "snippet": item.get("snippet", ""),
-                "updated_at": fm.get("updated_at", ""),
-            })
+                page_scope = fm.get("scope", "shared")
+                if scope != "shared" and page_scope != scope:
+                    continue
 
-            if len(results) >= target_limit:
+                results.append({
+                    "page_id": item.get("page_id", ""),
+                    "path": item["path"],
+                    "title": item.get("title", ""),
+                    "type": fm.get("type", ""),
+                    "scope": page_scope,
+                    "relevance": round(item.get("rank", 0), 4),
+                    "snippet": item.get("snippet", ""),
+                    "updated_at": fm.get("updated_at", ""),
+                })
+
+                if len(results) >= target_limit:
+                    break
+
+            offset += page_size
+            # 安全上限：最多拉取 200 条避免无限循环
+            if offset >= 200:
                 break
 
+        if not results and offset == 0:
+            return None
         return results
 
     def _search_claims_fts(self, question: str) -> list[dict] | None:
