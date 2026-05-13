@@ -1,5 +1,6 @@
-"""Staging 写入 — 先写临时目录，校验通过后 rename 到正式 Wiki。"""
+"""Staging 写入 — 先写临时目录，校验通过后原子写入正式 Wiki。"""
 
+import os
 from pathlib import Path
 
 from mini_note.models.path_utils import validate_path_in_workspace
@@ -39,7 +40,10 @@ def write_to_staging(workspace: Path, rel_path: str, content: str) -> Path:
 
 
 def apply_staged_changes(workspace: Path, staged_files: list[Path]) -> list[Path]:
-    """将 staging 目录下的文件移动到正式 wiki 目录。
+    """将 staging 目录下的文件原子写入正式 wiki 目录。
+
+    每次写入使用 tmp + fsync + os.replace 保证原子性，
+    故障时不会留下半写入文件。
 
     Returns:
         实际写入的正式路径列表
@@ -51,7 +55,15 @@ def apply_staged_changes(workspace: Path, staged_files: list[Path]) -> list[Path
         rel = sf.relative_to(staging_dir)
         dest = workspace / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(sf.read_text(encoding="utf-8"))
+
+        data = sf.read_text(encoding="utf-8")
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as wf:
+            wf.write(data)
+            wf.flush()
+            os.fsync(wf.fileno())
+        os.replace(tmp, dest)
+
         sf.unlink()  # 清理 staging
         applied.append(dest)
 

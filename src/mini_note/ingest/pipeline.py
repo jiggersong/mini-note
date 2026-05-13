@@ -25,6 +25,7 @@ class IngestResult:
     operation_id: str | None = None
     source_id: str | None = None
     ingestion_status: str = "full"
+    backup_status: str = "none"
     error_code: str | None = None
     message: str | None = None
     retryable: bool = False
@@ -85,7 +86,7 @@ class IngestPipeline:
 
             # 2. Register source
             registry = SourceRegistry(self.workspace)
-            source_id = registry.register(file_path, owner_id=owner_id)
+            source_id = registry.register(file_path, owner_id=owner_id, scope=scope)
             sha = compute_sha256(file_path)
 
             # 3. Extract content
@@ -137,19 +138,40 @@ class IngestPipeline:
             if not health["ok"]:
                 raise RuntimeError("Health check 失败: " + str(health["checks"]))
 
-            # 11. OSS backup — 创建本地快照（OSS 上传在实际部署中完成）
+            # 11. Create local snapshot
             snapshot_path = self.workspace / ".state" / "staging" / f"{operation_id}.tar.gz"
             snapshot_path.parent.mkdir(parents=True, exist_ok=True)
             snapshot_sha = create_snapshot(self.workspace, snapshot_path, compression="gzip")
 
-            # 12. Emit review tasks (MVP: 简化)
+            # 12. OSS upload — 有配置就必须上传，否则如实记录状态
+            oss_ok = False
+            oss_error = None
+            try:
+                from mini_note.backup.oss import OSSBackup
+                oss = OSSBackup()
+                if oss.enabled:
+                    oss_result = oss.upload(snapshot_path, operation_id)
+                    oss_ok = oss_result.get("ok", False)
+                    if not oss_ok:
+                        oss_error = oss_result.get("error")
+            except Exception as e:
+                oss_error = str(e)
+
+            if oss_ok:
+                backup_status = "backed_up"
+            elif oss_error:
+                backup_status = "backup_failed"
+            else:
+                backup_status = "indexed"
+
+            # 13. Emit review tasks (MVP: 简化)
             # 如有冲突 claim 则生成 review task
 
             # 记录 operation manifest
             op = OperationManifest(
                 operation_id=operation_id,
                 type="ingest",
-                status="backed_up",
+                status=backup_status,
                 source_ids=[source_id],
                 planned_changes=[
                     {"action": "create_page", "path": source_page_rel},
@@ -175,6 +197,7 @@ class IngestPipeline:
                 operation_id=operation_id,
                 source_id=source_id,
                 ingestion_status=ext_result.status,
+                backup_status=backup_status,
                 source_page_path=source_page_rel,
             )
 

@@ -43,6 +43,7 @@ class SourceRegistry:
         self,
         path: Path,
         owner_id: str,
+        scope: str = "shared",
         max_text_mb: int = 2,
         max_pdf_pages: int = 100,
     ) -> str:
@@ -80,7 +81,7 @@ class SourceRegistry:
             "stored_path": str(dest_file.relative_to(self.workspace)),
             "sha256": sha,
             "owner_id": owner_id,
-            "scope": "shared",
+            "scope": scope,
             "media_type": media_type,
             "size_bytes": size_bytes,
             "ingestion_status": status,

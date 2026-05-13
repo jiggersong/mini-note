@@ -246,13 +246,19 @@ def _cmd_ingest(args: argparse.Namespace) -> dict:
         owner_id=args.owner,
         scope=args.scope,
     )
-    return {
+    out = {
         "ok": result.ok,
         "operation_id": result.operation_id,
         "source_id": result.source_id,
         "ingestion_status": result.ingestion_status,
+        "backup_status": result.backup_status,
         "source_page_path": result.source_page_path,
     }
+    if not result.ok:
+        out["error_code"] = result.error_code
+        out["message"] = result.message
+        out["retryable"] = result.retryable
+    return out
 
 
 def _cmd_ingest_scan(args: argparse.Namespace) -> dict:
@@ -276,12 +282,17 @@ def _cmd_ingest_scan(args: argparse.Namespace) -> dict:
             owner_id=args.owner,
             scope=args.scope,
         )
-        results.append({
+        item = {
             "file": str(f.relative_to(ws)),
             "ok": r.ok,
             "source_id": r.source_id,
             "ingestion_status": r.ingestion_status,
-        })
+        }
+        if not r.ok:
+            item["error_code"] = r.error_code
+            item["message"] = r.message
+            item["retryable"] = r.retryable
+        results.append(item)
 
     return {"ok": True, "results": results}
 

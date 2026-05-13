@@ -69,12 +69,43 @@ def create_snapshot(
 
 
 def restore_snapshot(snapshot_path: Path, restore_dir: Path) -> None:
-    """解压快照到恢复目录。"""
+    """解压快照到恢复目录。
+
+    逐个校验 tar member 的规范化路径必须在 restore_dir 内，
+    防止恶意 tar 包通过 ../ 或绝对路径穿越写入。
+    """
+    import os
+
     restore_dir.mkdir(parents=True, exist_ok=True)
+    resolved_restore = restore_dir.resolve()
 
     mode = "r:gz" if snapshot_path.suffix == ".gz" else "r"
     with tarfile.open(snapshot_path, mode) as tar:
-        tar.extractall(path=restore_dir)
+        for member in tar.getmembers():
+            target = (restore_dir / member.name).resolve()
+            try:
+                target.relative_to(resolved_restore)
+            except ValueError:
+                raise ValueError(
+                    f"tar 路径穿越拒绝: {member.name} → {target}"
+                )
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif member.isfile():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                fh = tar.extractfile(member)
+                if fh is None:
+                    continue
+                # 安全写入：临时文件 + fsync + 原子 replace
+                data = fh.read()
+                tmp = target.with_suffix(target.suffix + ".tmp")
+                with open(tmp, "wb") as wf:
+                    wf.write(data)
+                    wf.flush()
+                    os.fsync(wf.fileno())
+                os.replace(tmp, target)
+            elif member.issym() or member.islnk():
+                raise ValueError(f"tar 快照不允许符号链接或硬链接: {member.name}")
 
     # 确保必要目录存在
     for sub in [".state/staging", ".state/health", ".state/operations",
