@@ -159,10 +159,16 @@ class IngestPipeline:
 
             if oss_ok:
                 backup_status = "backed_up"
+                # OSS 上传成功，清理本地临时快照
+                snapshot_path.unlink(missing_ok=True)
             elif oss_error:
                 backup_status = "backup_failed"
+                # 上传失败，保留本地快照作为 fallback，但只保留最近 3 个
+                _prune_staging_snapshots(self.workspace, keep=3)
             else:
                 backup_status = "indexed"
+                # 无 OSS 配置，本地快照即为唯一备份，保留但限制数量
+                _prune_staging_snapshots(self.workspace, keep=5)
 
             # 13. Emit review tasks (MVP: 简化)
             # 如有冲突 claim 则生成 review task
@@ -232,6 +238,20 @@ def _acquire_lock(workspace: Path) -> None:
         if age < 300:
             raise RuntimeError("已有 ingest 操作正在执行")
     lock_file.write_text("locked")
+
+
+def _prune_staging_snapshots(workspace: Path, keep: int) -> None:
+    """清理 .state/staging/ 中的旧快照，只保留最近 keep 个 .tar.gz。"""
+    staging = workspace / ".state" / "staging"
+    if not staging.exists():
+        return
+    tars = sorted(
+        staging.glob("*.tar.gz"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for old in tars[keep:]:
+        old.unlink(missing_ok=True)
 
 
 def _release_lock(workspace: Path) -> None:

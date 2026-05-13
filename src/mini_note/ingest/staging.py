@@ -67,4 +67,14 @@ def apply_staged_changes(workspace: Path, staged_files: list[Path]) -> list[Path
         sf.unlink()  # 清理 staging
         applied.append(dest)
 
+    # 清理 staging 中由本次写入产生的空目录（如 wiki/sources/...）
+    _cleanup_empty_dirs(staging_dir)
+
     return applied
+
+
+def _cleanup_empty_dirs(root: Path) -> None:
+    """自底向上删除 root 下的空目录，但不删除 root 本身。"""
+    for d in sorted(root.rglob("*"), reverse=True):
+        if d.is_dir() and d != root and not any(d.iterdir()):
+            d.rmdir()

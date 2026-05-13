@@ -83,6 +83,7 @@ def main(argv: list[str] | None = None) -> dict | list:
     backup_create = backup_sp.add_parser("create", help="创建备份")
     backup_create.add_argument("--workspace", type=Path, default=Path.cwd())
     backup_create.add_argument("--reason", type=str, default="manual")
+    backup_create.add_argument("--keep-local", action="store_true", default=False)
     backup_create.add_argument("--json", action="store_true", default=False)
 
     # restore
@@ -92,6 +93,14 @@ def main(argv: list[str] | None = None) -> dict | list:
     restore_verify.add_argument("--workspace", type=Path, default=Path.cwd())
     restore_verify.add_argument("--snapshot", type=str, default="")
     restore_verify.add_argument("--json", action="store_true", default=False)
+
+    # maintenance
+    maint_p = subparsers.add_parser("maintenance", help="维护管理")
+    maint_sp = maint_p.add_subparsers(dest="maintenance_command")
+    maint_cleanup = maint_sp.add_parser("cleanup", help="清理临时文件")
+    maint_cleanup.add_argument("--workspace", type=Path, default=Path.cwd())
+    maint_cleanup.add_argument("--keep-snapshots", type=int, default=5)
+    maint_cleanup.add_argument("--json", action="store_true", default=False)
 
     # review
     review_p = subparsers.add_parser("review", help="审核管理")
@@ -167,6 +176,8 @@ def _dispatch(args: argparse.Namespace) -> dict | list:
         return _cmd_restore(args)
     elif cmd == "review":
         return _cmd_review(args)
+    elif cmd == "maintenance":
+        return _cmd_maintenance(args)
     else:
         return _error_result(
             error_code="UNKNOWN_COMMAND",
@@ -321,6 +332,7 @@ def _cmd_backup(args: argparse.Namespace) -> dict:
         from datetime import datetime, timezone, timedelta
         from mini_note.backup.snapshot import create_snapshot
         from mini_note.backup.status import BackupLog
+        from mini_note.ingest.pipeline import _prune_staging_snapshots
         import secrets
 
         ws: Path = args.workspace
@@ -333,15 +345,30 @@ def _cmd_backup(args: argparse.Namespace) -> dict:
 
         # OSS 上传（如已配置）
         oss_result = None
+        oss_configured = False
         try:
             from mini_note.backup.oss import OSSBackup
             oss = OSSBackup()
-            oss_result = oss.upload(snapshot_path, snapshot_id)
+            if oss.enabled:
+                oss_configured = True
+                oss_result = oss.upload(snapshot_path, snapshot_id)
         except Exception:
             oss_result = {"ok": False, "error": "OSS 上传异常"}
 
         oss_ok = oss_result.get("ok", False) if oss_result else True
         oss_key = oss_result.get("oss_key", "") if oss_result else ""
+
+        # 快照生命周期：OSS 成功则删本地包，本地模式/失败则保留最近 N 个
+        keep_local = getattr(args, "keep_local", False)
+        if oss_configured and oss_ok and not keep_local:
+            # OSS 上传成功，本地临时包已完成使命，删除
+            snapshot_path.unlink(missing_ok=True)
+        elif oss_configured and not oss_ok:
+            # OSS 上传失败，保留本地包作为 fallback，只保留最近 3 个
+            _prune_staging_snapshots(ws, keep=3)
+        elif not oss_configured and not keep_local:
+            # 无 OSS，本地包即唯一备份，保留最近 5 个
+            _prune_staging_snapshots(ws, keep=5)
 
         log = BackupLog(ws / ".state" / "backup_log.jsonl")
         log.record(
@@ -460,6 +487,43 @@ def _cmd_review(args: argparse.Namespace) -> dict | list:
     return _error_result(
         error_code="UNKNOWN_COMMAND",
         message=f"未知 review 子命令: {args.review_command}",
+        retryable=False,
+    )
+
+
+def _cmd_maintenance(args: argparse.Namespace) -> dict:
+    if args.maintenance_command == "cleanup":
+        from shutil import rmtree
+        from mini_note.ingest.pipeline import _prune_staging_snapshots
+
+        ws: Path = args.workspace
+        staging = ws / ".state" / "staging"
+
+        # 清理旧快照
+        _prune_staging_snapshots(ws, keep=args.keep_snapshots)
+
+        # 清理 tmp 后缀（原子写入残留）
+        for tmp in staging.rglob("*.tmp"):
+            tmp.unlink(missing_ok=True)
+
+        # 清理空目录
+        removed_dirs = []
+        for d in sorted(staging.rglob("*"), reverse=True):
+            if d.is_dir() and d != staging and not any(d.iterdir()):
+                d.rmdir()
+                rel = str(d.relative_to(ws))
+                removed_dirs.append(rel)
+
+        # 统计剩余快照
+        remaining = sorted(staging.glob("*.tar.gz"))
+        return {
+            "ok": True,
+            "staging_snapshots": len(remaining),
+            "removed_dirs": removed_dirs,
+        }
+    return _error_result(
+        error_code="UNKNOWN_COMMAND",
+        message=f"未知 maintenance 子命令: {args.maintenance_command}",
         retryable=False,
     )
 
