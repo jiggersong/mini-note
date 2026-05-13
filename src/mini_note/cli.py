@@ -416,7 +416,7 @@ def _cmd_backup(args: argparse.Namespace) -> dict:
         )
 
         result: dict = {
-            "ok": True,
+            "ok": oss_ok,
             "mode": "oss",
             "snapshot_id": snapshot_id,
             "sha256": sha,
@@ -426,6 +426,10 @@ def _cmd_backup(args: argparse.Namespace) -> dict:
         }
         if oss_key:
             result["oss_key"] = oss_key
+        if not oss_ok:
+            result["error_code"] = "OSS_UPLOAD_FAILED"
+            result["message"] = oss_result.get("error", "OSS 上传失败") if oss_result else "OSS 上传失败"
+            result["retryable"] = True
         return result
 
     return _error_result(

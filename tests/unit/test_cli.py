@@ -142,6 +142,44 @@ class TestCLICommands:
         remaining = list(staging.glob("*.tar.gz"))
         assert len(remaining) <= 5
 
+    def test_backup_create_oss_upload_failure(self, tmp_workspace, monkeypatch):
+        """OSS 已配置但上传失败时返回 ok=false, OSS_UPLOAD_FAILED。"""
+        from mini_note.cli import main
+
+        # 设置 OSS 环境变量使 enabled=True
+        monkeypatch.setenv("OSS_ENDPOINT", "https://oss-cn-hangzhou.aliyuncs.com")
+        monkeypatch.setenv("OSS_BUCKET", "test-bucket")
+        monkeypatch.setenv("OSS_ACCESS_KEY_ID", "test-key")
+        monkeypatch.setenv("OSS_ACCESS_KEY_SECRET", "test-secret")
+
+        main(["init", "--workspace", str(tmp_workspace)])
+
+        # Mock OSSBackup.upload 返回失败
+        import mini_note.backup.oss as oss_module
+        original_upload = oss_module.OSSBackup.upload
+
+        def fake_upload(self, snapshot_path, snapshot_id):
+            return {"ok": False, "error": "mock upload failure"}
+
+        monkeypatch.setattr(oss_module.OSSBackup, "upload", fake_upload)
+
+        result = main([
+            "backup", "create",
+            "--workspace", str(tmp_workspace),
+            "--reason", "failure-test",
+            "--json",
+        ])
+        assert result["ok"] is False
+        assert result["error_code"] == "OSS_UPLOAD_FAILED"
+        assert result["retryable"] is True
+        assert result["oss_ok"] is False
+        assert result["mode"] == "oss"
+        assert "local_path" in result
+        assert "sha256" in result
+        # 本地 fallback 文件应存在
+        from pathlib import Path
+        assert Path(result["local_path"]).exists()
+
     def test_review_answer_command(self, tmp_workspace):
         """review answer 命令执行审核动作。"""
         from mini_note.cli import main

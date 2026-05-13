@@ -208,7 +208,7 @@ SQLite 数据库只是派生索引。`rm -rf .state/notes.db` 后可随时从 Ma
 
 ### 写入必校验
 
-LLM 不能直接写正式 Wiki。写入必须经过：JSON schema 校验 → 路径白名单校验 → claim 来源校验 → wikilink 校验 → staging 写入 → health check → OSS 备份记录。全流程由 operation manifest 追踪。
+LLM 不能直接写正式 Wiki。写入必须经过：JSON schema 校验 → 路径白名单校验 → claim 来源校验 → wikilink 校验 → staging 写入 → health check。全流程由 operation manifest 追踪。备份由独立的 `backup create` 命令（每日 cron）负责。
 
 ### 冲突不静默覆盖
 
@@ -236,7 +236,7 @@ PYTHONPATH=src python -m pytest tests/ -v
 ./verify.sh
 ```
 
-当前测试：244 passed, 10 skipped（OSS 云端测试需配置凭证）
+当前测试：245 passed, 10 skipped（OSS 云端测试需配置凭证）
 
 ---
 
