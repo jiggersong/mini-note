@@ -129,7 +129,7 @@ vars = ['OSS_ENDPOINT','OSS_BUCKET','OSS_ACCESS_KEY_ID','OSS_ACCESS_KEY_SECRET']
 missing = [v for v in vars if not os.getenv(v)]
 if missing:
     print(f'  未配置: {missing}')
-    print('  OSS 云端备份不可用（本地备份正常）')
+    print('  OSS 未配置，backup create 将跳过备份，不产生本地快照')
 else:
     print('  ✅ OSS 凭证完整，云端备份可用')
 " 2>/dev/null

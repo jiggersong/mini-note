@@ -117,16 +117,16 @@ cd mini-note
 
 ```
 你：「帮我把这份 PDF 记下来」
-AI：[调用 ./run.sh ingest ...] → 已摄入，生成了来源页和 3 条 claim。
+OpenClaw：已摄入，生成了来源页和 3 条 claim。
 
 你：「之前关于 ECS 性能的笔记有哪些？」
-AI：[调用 ./run.sh query ...] → 找到 5 个页面和 8 条 claim，核心要点是...
+OpenClaw：找到 5 个页面和 8 条 claim，核心要点是...
 
 你：「笔记系统状态怎么样？」
-AI：[调用 health + lint + review list] → 目录正常，无断链，无积压审核任务，已创建备份。
+OpenClaw：目录正常，无断链，无积压审核任务，备份任务已检查。
 ```
 
-Skill 文件定义了触发条件、命令映射、典型工作流和错误处理策略，AI 据此自动选择正确的 CLI 命令和参数。
+Skill 文件定义了触发条件、命令映射、典型工作流和错误处理策略。OpenClaw 根据这些规则调用 CLI，并把结构化结果整理成自然语言回复。
 
 ---
 
@@ -216,18 +216,6 @@ LLM 不能直接写正式 Wiki。写入必须经过：JSON schema 校验 → 路
 
 ---
 
-## 路线图
-
-| Phase | 目标 | 状态 |
-|-------|------|------|
-| 0 | 可靠性地基：目录结构、schema、单写锁、staging、SQLite、OSS 快照 | ✅ 完成 |
-| 1 | 文本类 MVP：md/txt/pdf/docx 摄入、claim 提取、Wiki 编译、查询 | ✅ 完成 |
-| 2 | Lint 与审核：claim grounding、冲突检测、review task | ✅ 完成 |
-| 3 | 多格式增强：xlsx/pptx/图片/音视频/代码 | ✅ 完成 |
-| 4 | 检索增强：FTS5 中文 bigram 全文检索 + rank 排序 | ✅ 完成 |
-
----
-
 ## 测试
 
 ```bash
@@ -235,8 +223,6 @@ source venv/bin/activate
 PYTHONPATH=src python -m pytest tests/ -v
 ./verify.sh
 ```
-
-当前测试：245 passed, 10 skipped（OSS 云端测试需配置凭证）
 
 ---
 
