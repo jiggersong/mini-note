@@ -338,7 +338,15 @@ def _cmd_backup(args: argparse.Namespace) -> dict:
         ws: Path = args.workspace
         now = datetime.now(timezone(timedelta(hours=8)))
         snapshot_id = f"snap-{now.strftime('%Y%m%d')}-{now.strftime('%H%M%S')}-{secrets.token_hex(4)}"
-        snapshot_path = ws / ".state" / "staging" / f"{snapshot_id}.tar.gz"
+        keep_local = getattr(args, "keep_local", False)
+
+        # --keep-local 写入专用备份目录，避免被 staging prune 误删
+        if keep_local:
+            snapshot_dir = ws / ".state" / "backups"
+            snapshot_path = snapshot_dir / f"{snapshot_id}.tar.gz"
+        else:
+            snapshot_dir = ws / ".state" / "staging"
+            snapshot_path = snapshot_dir / f"{snapshot_id}.tar.gz"
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
 
         sha = create_snapshot(ws, snapshot_path, compression="gzip")
@@ -355,38 +363,57 @@ def _cmd_backup(args: argparse.Namespace) -> dict:
         except Exception:
             oss_result = {"ok": False, "error": "OSS 上传异常"}
 
-        oss_ok = oss_result.get("ok", False) if oss_result else True
+        oss_ok = oss_result.get("ok", False) if oss_result else False
         oss_key = oss_result.get("oss_key", "") if oss_result else ""
+        mode = "oss" if oss_configured else "local"
 
-        # 快照生命周期：OSS 成功则删本地包，本地模式/失败则保留最近 N 个
-        keep_local = getattr(args, "keep_local", False)
+        # 快照生命周期
         if oss_configured and oss_ok and not keep_local:
             # OSS 上传成功，本地临时包已完成使命，删除
             snapshot_path.unlink(missing_ok=True)
+            local_path = None
         elif oss_configured and not oss_ok:
             # OSS 上传失败，保留本地包作为 fallback，只保留最近 3 个
-            _prune_staging_snapshots(ws, keep=3)
+            if not keep_local:
+                _prune_staging_snapshots(ws, keep=3)
+            local_path = str(snapshot_path)
         elif not oss_configured and not keep_local:
             # 无 OSS，本地包即唯一备份，保留最近 5 个
             _prune_staging_snapshots(ws, keep=5)
+            local_path = str(snapshot_path)
+        else:
+            local_path = str(snapshot_path)
+
+        # 日志状态
+        if oss_configured and oss_ok:
+            log_status = "success"
+        elif oss_configured and not oss_ok:
+            log_status = "failed"
+        else:
+            log_status = "local_created"
 
         log = BackupLog(ws / ".state" / "backup_log.jsonl")
         log.record(
             oss_object=oss_key or snapshot_id,
             sha256=sha,
-            status="success" if oss_ok else "created",
+            status=log_status,
             operation_id=snapshot_id,
-            error=None if oss_ok else oss_result.get("error"),
+            error=None if oss_ok else (oss_result.get("error") if oss_result else None),
         )
 
-        return {
-            "ok": oss_ok,
+        result = {
+            "ok": True,
+            "mode": mode,
             "snapshot_id": snapshot_id,
             "sha256": sha,
-            "oss_key": oss_key,
             "oss_ok": oss_ok,
             "reason": args.reason,
         }
+        if oss_key:
+            result["oss_key"] = oss_key
+        if local_path:
+            result["local_path"] = local_path
+        return result
     return _error_result(
         error_code="UNKNOWN_COMMAND",
         message=f"未知 backup 子命令: {args.backup_command}",

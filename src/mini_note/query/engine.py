@@ -52,11 +52,12 @@ class QueryEngine:
             return None
 
         fts = FTSIndex(self.workspace)
-        raw = fts.search_pages(question, scope=scope)
+        target_limit = 10
+        raw = fts.search_pages(question, limit=target_limit * 3)
         if not raw:
             return None  # 可能 FTS 表不存在
 
-        # 补充 frontmatter 信息
+        # 补充 frontmatter 信息 + scope 过滤
         results = []
         for item in raw:
             page_path = self.workspace / item["path"]
@@ -68,16 +69,24 @@ class QueryEngine:
                 except Exception:
                     pass
 
+            page_scope = fm.get("scope", "shared")
+            # 与 fallback 路径一致的 scope 过滤逻辑
+            if scope != "shared" and page_scope != scope:
+                continue
+
             results.append({
                 "page_id": item.get("page_id", ""),
                 "path": item["path"],
                 "title": item.get("title", ""),
                 "type": fm.get("type", ""),
-                "scope": fm.get("scope", "shared"),
+                "scope": page_scope,
                 "relevance": round(item.get("rank", 0), 4),
                 "snippet": item.get("snippet", ""),
                 "updated_at": fm.get("updated_at", ""),
             })
+
+            if len(results) >= target_limit:
+                break
 
         return results
 

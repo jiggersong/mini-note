@@ -8,6 +8,8 @@ CLI 入口单元测试 — argparse 命令解析、--json 输出、错误格式�
 """
 
 import json
+from pathlib import Path
+
 import pytest
 
 
@@ -110,8 +112,51 @@ class TestCLICommands:
         main(["init", "--workspace", str(tmp_workspace)])
         result = main(["backup", "create", "--workspace", str(tmp_workspace), "--reason", "test", "--json"])
         assert result["ok"] is True
+        assert result["mode"] == "local"
         assert "snapshot_id" in result
         assert "sha256" in result
+        assert "local_path" in result
+
+    def test_backup_create_local_mode_fields(self, tmp_workspace):
+        """无 OSS 时 backup create 返回 mode=local, oss_ok=false。"""
+        from mini_note.cli import main
+
+        main(["init", "--workspace", str(tmp_workspace)])
+        result = main(["backup", "create", "--workspace", str(tmp_workspace), "--reason", "test", "--json"])
+        assert result["mode"] == "local"
+        assert result["oss_ok"] is False
+        assert "oss_key" not in result
+        assert "local_path" in result
+
+    def test_backup_create_prunes_old_local_snapshots(self, tmp_workspace):
+        """本地模式只保留最近 5 个快照。"""
+        from mini_note.cli import main
+
+        main(["init", "--workspace", str(tmp_workspace)])
+        staging = tmp_workspace / ".state" / "staging"
+        # 先创建 7 个快照
+        for i in range(7):
+            main(["backup", "create", "--workspace", str(tmp_workspace), "--reason", f"test-{i}", "--json"])
+
+        remaining = list(staging.glob("*.tar.gz"))
+        assert len(remaining) <= 5
+
+    def test_backup_create_keep_local_writes_to_backups_dir(self, tmp_workspace):
+        """--keep-local 写入 .state/backups/ 而非 staging。"""
+        from mini_note.cli import main
+
+        main(["init", "--workspace", str(tmp_workspace)])
+        result = main([
+            "backup", "create",
+            "--workspace", str(tmp_workspace),
+            "--reason", "keep-test",
+            "--keep-local",
+            "--json",
+        ])
+        assert result["ok"] is True
+        local_path = Path(result["local_path"])
+        assert ".state/backups" in str(local_path)
+        assert local_path.exists()
 
     def test_review_answer_command(self, tmp_workspace):
         """review answer 命令执行审核动作。"""

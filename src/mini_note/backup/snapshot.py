@@ -1,6 +1,8 @@
-"""快照打包与恢复 — tar 压缩、hash 校验。"""
+"""快照打包与恢复 — tar 压缩、hash 校验、流式恢复。"""
 
 import hashlib
+import os
+import shutil
 import tarfile
 from pathlib import Path
 
@@ -62,10 +64,18 @@ def create_snapshot(
                 with open(p, "rb") as fh:
                     tar.addfile(ti, fh)
 
-    # 计算 hash
-    data = output.read_bytes()
-    sha = hashlib.sha256(data).hexdigest()
+    # 分块计算 hash，大文件不 OOM
+    sha = _sha256_file_chunked(output)
     return sha
+
+
+def _sha256_file_chunked(path: Path, chunk_size: int = 1 << 20) -> str:
+    """分块计算文件 SHA256，避免大文件 OOM。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(chunk_size):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def restore_snapshot(snapshot_path: Path, restore_dir: Path) -> None:
@@ -73,9 +83,8 @@ def restore_snapshot(snapshot_path: Path, restore_dir: Path) -> None:
 
     逐个校验 tar member 的规范化路径必须在 restore_dir 内，
     防止恶意 tar 包通过 ../ 或绝对路径穿越写入。
+    文件恢复使用流式 copy，大 member 不 OOM。
     """
-    import os
-
     restore_dir.mkdir(parents=True, exist_ok=True)
     resolved_restore = restore_dir.resolve()
 
@@ -96,11 +105,10 @@ def restore_snapshot(snapshot_path: Path, restore_dir: Path) -> None:
                 fh = tar.extractfile(member)
                 if fh is None:
                     continue
-                # 安全写入：临时文件 + fsync + 原子 replace
-                data = fh.read()
+                # 流式写入：临时文件 + fsync + 原子 replace
                 tmp = target.with_suffix(target.suffix + ".tmp")
                 with open(tmp, "wb") as wf:
-                    wf.write(data)
+                    shutil.copyfileobj(fh, wf)
                     wf.flush()
                     os.fsync(wf.fileno())
                 os.replace(tmp, target)

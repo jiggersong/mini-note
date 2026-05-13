@@ -1,13 +1,16 @@
 """
-Backup 单元测试 — OSS 快照上传、校验、恢复演练。
+Backup 单元测试 — 快照打包、hash 校验、恢复演练、路径穿越防护。
 
 测试目标（v2.4 §18.1）:
 - 快照文件包含正确的 hash
 - 备份失败有重试机制
 - 快照内容完整
+- tar 路径穿越拒绝
 """
 
 import hashlib
+import io
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -170,3 +173,80 @@ class TestBackupStatus:
         entries = log.read_all()
         assert entries[-1]["status"] == "success"
         assert entries[-1]["attempt"] == 3
+
+
+# ============================================================
+# 路径穿越防护
+# ============================================================
+
+class TestPathTraversal:
+    """测试 tar 路径穿越拒绝。"""
+
+    def test_restore_rejects_dotdot_path(self, tmp_workspace):
+        """包含 ../ 的 tar member 应被拒绝。"""
+        from mini_note.backup.snapshot import restore_snapshot
+
+        # 构造恶意 tar：包含 ../../etc/passwd 路径
+        malicious = tmp_workspace / "malicious.tar"
+        with tarfile.open(malicious, "w") as tar:
+            info = tarfile.TarInfo(name="../../etc/passwd")
+            info.type = tarfile.REGTYPE
+            info.size = 6
+            tar.addfile(info, io.BytesIO(b"pwned\n"))
+
+        restore_dir = tmp_workspace / "restored"
+        restore_dir.mkdir()
+        with pytest.raises(ValueError, match="路径穿越"):
+            restore_snapshot(malicious, restore_dir)
+
+    def test_restore_rejects_absolute_path(self, tmp_workspace):
+        """绝对路径的 tar member 应被拒绝。"""
+        from mini_note.backup.snapshot import restore_snapshot
+
+        malicious = tmp_workspace / "malicious.tar"
+        with tarfile.open(malicious, "w") as tar:
+            info = tarfile.TarInfo(name="/etc/cron.d/mini-note")
+            info.type = tarfile.REGTYPE
+            info.size = 6
+            tar.addfile(info, io.BytesIO(b"pwned\n"))
+
+        restore_dir = tmp_workspace / "restored"
+        restore_dir.mkdir()
+        with pytest.raises(ValueError, match="路径穿越"):
+            restore_snapshot(malicious, restore_dir)
+
+    def test_restore_rejects_symlink(self, tmp_workspace):
+        """符号链接 tar member 应被拒绝。"""
+        from mini_note.backup.snapshot import restore_snapshot
+
+        malicious = tmp_workspace / "malicious.tar"
+        with tarfile.open(malicious, "w") as tar:
+            data = b"ok\n"
+            info = tarfile.TarInfo(name="safe-file")
+            info.type = tarfile.REGTYPE
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+            sym = tarfile.TarInfo(name="escape")
+            sym.type = tarfile.SYMTYPE
+            sym.linkname = "/etc/passwd"
+            tar.addfile(sym)
+
+        restore_dir = tmp_workspace / "restored"
+        restore_dir.mkdir()
+        with pytest.raises(ValueError, match="不允许"):
+            restore_snapshot(malicious, restore_dir)
+
+    def test_restore_normal_snapshot_succeeds(self, tmp_workspace):
+        """正常快照恢复成功（非回归验证）。"""
+        from mini_note.backup.snapshot import create_snapshot, restore_snapshot
+
+        (tmp_workspace / "wiki" / "index.md").write_text("# test")
+        snap = tmp_workspace / "ok.tar.gz"
+        create_snapshot(tmp_workspace, snap)
+
+        restore_dir = tmp_workspace / "restored"
+        restore_dir.mkdir()
+        restore_snapshot(snap, restore_dir)
+
+        assert (restore_dir / "wiki" / "index.md").read_text() == "# test"

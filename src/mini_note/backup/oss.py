@@ -110,16 +110,19 @@ class OSSBackup:
         oss_key = self._oss_key(snapshot_id)
 
         try:
-            # 可选：客户端加密
-            data = snapshot_path.read_bytes()
-            if self.config.encryption_key:
-                data = _aes_encrypt(data, self.config.encryption_key)
-
             bucket = self._get_client()
-            bucket.put_object(oss_key, data)
 
-            # 校验远程 hash
-            remote_sha = _sha256_data(data)
+            if self.config.encryption_key:
+                # 加密需全量读入内存（AES-GCM 不支持流式）
+                data = snapshot_path.read_bytes()
+                data = _aes_encrypt(data, self.config.encryption_key)
+                bucket.put_object(oss_key, data)
+                remote_sha = _sha256_data(data)
+            else:
+                # 无加密时流式上传，大文件不 OOM
+                bucket.put_object_from_file(oss_key, str(snapshot_path))
+                remote_sha = _sha256_file(snapshot_path)
+
             return {
                 "ok": True,
                 "oss_key": oss_key,

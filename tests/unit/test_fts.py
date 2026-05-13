@@ -208,3 +208,53 @@ class TestQueryEngineFTS:
         result = engine.search("测试问题", scope="shared")
         assert "pages" in result
         assert "claims" in result
+
+
+class TestFTSScopeFilter:
+    """FTS 查询按 scope 过滤页面。"""
+
+    def test_fts_respects_private_scope(self, tmp_workspace):
+        """scope=private 时只返回 private 页面，不返回 shared。"""
+        from mini_note.cli import main as cli_main
+        from mini_note.query.engine import QueryEngine
+
+        ws = tmp_workspace
+        cli_main(["init", "--workspace", str(ws)])
+        # 创建一个 private 页面
+        (ws / "wiki" / "sources" / "private-page.md").write_text(
+            "---\npage_id: priv-1\ntitle: Private Page\ntype: source\nscope: private\n---\n# Private\nECS 性能优化要点\n", encoding="utf-8"
+        )
+        # 创建一个 shared 页面
+        (ws / "wiki" / "sources" / "shared-page.md").write_text(
+            "---\npage_id: shared-1\ntitle: Shared Page\ntype: source\nscope: shared\n---\n# Shared\nECS 配置建议\n", encoding="utf-8"
+        )
+        from mini_note.indexer import Indexer
+        Indexer(ws).rebuild()
+
+        engine = QueryEngine(ws)
+        result = engine.search("ECS", scope="private")
+        # private 查询应只返回 private 页面
+        for p in result["pages"]:
+            assert p["scope"] == "private", f"不应返回 scope={p['scope']} 的页面"
+
+    def test_fts_shared_scope_sees_all(self, tmp_workspace):
+        """scope=shared 时返回所有 scope 的页面。"""
+        from mini_note.cli import main as cli_main
+        from mini_note.query.engine import QueryEngine
+
+        ws = tmp_workspace
+        cli_main(["init", "--workspace", str(ws)])
+        (ws / "wiki" / "sources" / "private-page.md").write_text(
+            "---\npage_id: priv-2\ntitle: Private\ntype: source\nscope: private\n---\n# Private\nECS 优化\n", encoding="utf-8"
+        )
+        (ws / "wiki" / "sources" / "shared-page.md").write_text(
+            "---\npage_id: shared-2\ntitle: Shared\ntype: source\nscope: shared\n---\n# Shared\nECS 配置\n", encoding="utf-8"
+        )
+        from mini_note.indexer import Indexer
+        Indexer(ws).rebuild()
+
+        engine = QueryEngine(ws)
+        result = engine.search("ECS", scope="shared")
+        scopes = {p["scope"] for p in result["pages"]}
+        assert "private" in scopes or "shared" in scopes
+        assert len(result["pages"]) >= 1

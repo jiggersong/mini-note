@@ -4,6 +4,8 @@
 运行方式: PYTHONPATH=src python -m pytest tests/integration/test_oss_backup.py -v
 """
 
+from pathlib import Path
+
 import pytest
 
 from tests.conftest import requires_oss
@@ -298,3 +300,84 @@ class TestOSSCLILocal:
         ])
         assert result["ok"] is False
         assert result["error_code"] == "MISSING_SNAPSHOT"
+
+    def test_local_mode_keeps_at_most_5_snapshots(self, tmp_workspace):
+        """本地模式 backup create 只保留最近 5 个 tar.gz。"""
+        from mini_note.cli import main
+
+        main(["init", "--workspace", str(tmp_workspace)])
+        staging = tmp_workspace / ".state" / "staging"
+        for i in range(8):
+            main(["backup", "create", "--workspace", str(tmp_workspace), "--reason", f"test-{i}", "--json"])
+
+        tars = list(staging.glob("*.tar.gz"))
+        assert len(tars) <= 5, f"本地模式应最多保留 5 个快照，实际 {len(tars)}"
+
+    def test_keep_local_writes_to_backups_not_staging(self, tmp_workspace):
+        """--keep-local 快照写入 .state/backups/，不被 prune 误删。"""
+        from mini_note.cli import main
+
+        main(["init", "--workspace", str(tmp_workspace)])
+        result = main([
+            "backup", "create",
+            "--workspace", str(tmp_workspace),
+            "--reason", "keep-test",
+            "--keep-local",
+            "--json",
+        ])
+        local_path = Path(result["local_path"])
+        backups_dir = tmp_workspace / ".state" / "backups"
+        assert backups_dir in local_path.parents
+        assert local_path.exists()
+
+    def test_keep_local_survives_prune(self, tmp_workspace):
+        """--keep-local 快照不被后续 backup 的 prune 删除。"""
+        from mini_note.cli import main
+
+        main(["init", "--workspace", str(tmp_workspace)])
+
+        # 创建一个 keep-local 快照
+        kept = main([
+            "backup", "create",
+            "--workspace", str(tmp_workspace),
+            "--reason", "keep-me",
+            "--keep-local",
+            "--json",
+        ])
+        kept_path = Path(kept["local_path"])
+
+        # 创建多个普通备份触发 prune
+        for i in range(10):
+            main(["backup", "create", "--workspace", str(tmp_workspace), "--reason", f"prune-{i}", "--json"])
+
+        # keep-local 的快照应该还在
+        assert kept_path.exists(), "--keep-local 快照不应被后续 prune 删除"
+
+    def test_maintenance_cleanup_removes_old_snapshots(self, tmp_workspace):
+        """maintenance cleanup 清理过期快照。"""
+        from mini_note.cli import main
+
+        main(["init", "--workspace", str(tmp_workspace)])
+        staging = tmp_workspace / ".state" / "staging"
+        for i in range(6):
+            (staging / f"old-{i}.tar.gz").write_bytes(b"fake")
+
+        result = main(["maintenance", "cleanup", "--workspace", str(tmp_workspace), "--keep-snapshots", "2", "--json"])
+        assert result["ok"] is True
+        remaining = list(staging.glob("*.tar.gz"))
+        assert len(remaining) <= 2
+
+    def test_maintenance_cleanup_removes_tmp_residue(self, tmp_workspace):
+        """maintenance cleanup 清理 .tmp 残留。"""
+        from mini_note.cli import main
+
+        main(["init", "--workspace", str(tmp_workspace)])
+        staging = tmp_workspace / ".state" / "staging"
+        (staging / "wiki" / "sources").mkdir(parents=True)
+        (staging / "stale.tmp").write_text("leftover")
+
+        main(["maintenance", "cleanup", "--workspace", str(tmp_workspace), "--json"])
+        assert not list(staging.rglob("*.tmp"))
+        # 空目录也应清理
+        assert not (staging / "wiki" / "sources").exists()
+        assert not (staging / "wiki").exists()
