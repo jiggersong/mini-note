@@ -59,6 +59,9 @@ cd mini-note
 ### 使用
 
 ```bash
+# 批量导入已有目录
+./import.sh ~/Documents/notes
+
 # 摄入单个文件
 ./run.sh ingest --file doc.xlsx --owner user-default --scope shared
 
