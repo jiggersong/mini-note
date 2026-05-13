@@ -46,14 +46,20 @@ class OSSConfig:
         return bool(self.endpoint and self.bucket and self.access_key_id)
 
 
+_UNSET = object()
+
+
 class OSSBackup:
     """OSS 备份客户端：快照上传/下载/列表/验证。
 
     无 OSS 配置时退化为本地模式（操作均返回 ok=True 但无远程效果）。
     """
 
-    def __init__(self, config: OSSConfig | None = None):
-        self.config = config or OSSConfig.from_env()
+    def __init__(self, config: OSSConfig | None = _UNSET):
+        if config is _UNSET:
+            self.config = OSSConfig.from_env()
+        else:
+            self.config = config
         self._client = None
 
     @property

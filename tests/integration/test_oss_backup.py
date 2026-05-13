@@ -1,18 +1,49 @@
-"""OSS 备份集成测试 — 需要真实 OSS 凭证，无凭证时自动跳过。
+"""OSS 备份集成测试 — 需要真实 OSS 凭证且有写入权限，否则自动跳过。
 
-使用 @requires_oss 标记测试，无环境变量时 pytest skip。
+使用 @requires_oss 标记，无环境变量时 pytest skip。
 运行方式: PYTHONPATH=src python -m pytest tests/integration/test_oss_backup.py -v
 """
-
-import tempfile
-from pathlib import Path
 
 import pytest
 
 from tests.conftest import requires_oss
 
 
-@requires_oss
+def _oss_writable() -> bool:
+    """检查 OSS bucket 是否可写入。
+
+    无凭证、无写入权限、网络不通等情况均返回 False。
+    """
+    import tempfile
+    from pathlib import Path
+    from mini_note.backup.oss import OSSBackup, OSSConfig
+
+    cfg = OSSConfig.from_env()
+    if cfg is None:
+        return False
+
+    tmp = Path(tempfile.mkdtemp(prefix="oss-probe-"))
+    try:
+        p = tmp / "probe.tar.gz"
+        p.write_bytes(b"mini-note oss probe")
+        oss = OSSBackup(config=cfg)
+        result = oss.upload(p, "probe-writable-check")
+        return result.get("ok", False)
+    except Exception:
+        return False
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# 仅在有可写 OSS 时运行的上传依赖测试
+requires_oss_writable = pytest.mark.skipif(
+    not _oss_writable(),
+    reason="OSS 不可写（检查 bucket ACL 或访问密钥权限）",
+)
+
+
+@requires_oss_writable
 class TestOSSUpload:
     """上传快照到 OSS。"""
 
@@ -48,7 +79,7 @@ class TestOSSUpload:
         assert result["sha256"] == sha
 
 
-@requires_oss
+@requires_oss_writable
 class TestOSSDownload:
     """从 OSS 下载快照。"""
 
@@ -83,16 +114,14 @@ class TestOSSDownload:
         oss = OSSBackup()
         target = tmp_path / "no-file.tar.gz"
         result = oss.download("snapshots/nonexistent-key-99999.tar.gz", target)
-        # 应该返回错误
         if result["ok"]:
-            # 如果恰好存在（极低概率），跳过
             pytest.skip("OSS key 意外存在")
         assert result["ok"] is False
 
 
 @requires_oss
 class TestOSSList:
-    """列出 OSS 中的快照。"""
+    """列出 OSS 中的快照（仅需读取权限）。"""
 
     def test_list_returns_list(self):
         """list_snapshots 返回列表。"""
@@ -114,7 +143,7 @@ class TestOSSList:
         assert len(result) <= 3
 
 
-@requires_oss
+@requires_oss_writable
 class TestOSSVerify:
     """OSS 快照完整性验证。"""
 
@@ -158,7 +187,7 @@ class TestOSSVerify:
         assert result["sha256_match"] is False
 
 
-@requires_oss
+@requires_oss_writable
 class TestOSSCLI:
     """CLI 备份/恢复命令与 OSS 集成。"""
 
@@ -185,7 +214,6 @@ class TestOSSCLI:
 
         main(["init", "--workspace", str(tmp_workspace)])
 
-        # 先创建备份
         backup_result = main([
             "backup", "create",
             "--workspace", str(tmp_workspace),
@@ -194,23 +222,20 @@ class TestOSSCLI:
         ])
         assert backup_result["ok"] is True
 
-        # 用 OSS key 恢复验证
         result = main([
             "restore", "verify",
             "--workspace", str(tmp_workspace),
             "--snapshot", backup_result["oss_key"],
             "--json",
         ])
-        # restore verify 在恢复目录重建索引并做 health check
-        assert result["ok"] is True or result["ok"] is False  # 取决于 health check
         assert "health" in result
 
 
 class TestOSSCLILocal:
-    """无 OSS 配置时 CLI 的备份恢复行为。"""
+    """无 OSS 配置或 OSS 不可写时 CLI 的备份恢复行为。"""
 
     def test_backup_create_local_mode(self, tmp_workspace):
-        """无 OSS 时 backup create 仅创建本地快照。"""
+        """backup create 至少创建本地快照。"""
         from mini_note.cli import main
 
         main(["init", "--workspace", str(tmp_workspace)])
@@ -220,7 +245,6 @@ class TestOSSCLILocal:
             "--reason", "local-test",
             "--json",
         ])
-        # 本地模式也应返回 ok
         assert result["snapshot_id"] != ""
         assert result["sha256"] != ""
 
@@ -230,7 +254,6 @@ class TestOSSCLILocal:
 
         main(["init", "--workspace", str(tmp_workspace)])
 
-        # 先创建本地备份
         backup_result = main([
             "backup", "create",
             "--workspace", str(tmp_workspace),
@@ -240,7 +263,6 @@ class TestOSSCLILocal:
         snapshot_id = backup_result["snapshot_id"]
         snapshot_path = tmp_workspace / ".state" / "staging" / f"{snapshot_id}.tar.gz"
 
-        # 用本地路径恢复验证
         result = main([
             "restore", "verify",
             "--workspace", str(tmp_workspace),

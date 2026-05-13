@@ -372,8 +372,15 @@ def _cmd_restore(args: argparse.Namespace) -> dict:
             local_path = Path(snapshot_ref)
             if local_path.exists():
                 snapshot_path = local_path
+            elif snapshot_ref.startswith(("/", "~", ".")):
+                # 看起来像本地路径，不尝试 OSS
+                return _error_result(
+                    error_code="SNAPSHOT_NOT_FOUND",
+                    message=f"快照文件不存在: {snapshot_ref}",
+                    retryable=False,
+                )
             else:
-                # 本地不存在，尝试从 OSS 下载
+                # 不像本地路径，尝试从 OSS 下载
                 snapshot_path = None
                 try:
                     from mini_note.backup.oss import OSSBackup
@@ -395,7 +402,7 @@ def _cmd_restore(args: argparse.Namespace) -> dict:
                 if snapshot_path is None:
                     return _error_result(
                         error_code="SNAPSHOT_NOT_FOUND",
-                        message=f"快照不存在（本地和 OSS 均未找到）: {snapshot_ref}",
+                        message=f"快照不存在（OSS 未找到）: {snapshot_ref}",
                         retryable=False,
                     )
         else:
