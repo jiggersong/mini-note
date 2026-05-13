@@ -158,7 +158,6 @@ class OSSBackup:
             bucket = self._get_client()
             result = bucket.get_object(oss_key)
             data = result.read()
-            result.client.close()
 
             # 可选：解密
             if self.config.encryption_key:
