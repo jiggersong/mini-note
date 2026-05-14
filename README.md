@@ -35,6 +35,37 @@ OpenClaw Agent (Skill)          ← 大模型思考与决策
 - macOS 或 Linux（Windows 用户建议 WSL2）
 - 可选：阿里云 OSS bucket（用于备份）
 
+### Windows 用户
+
+mini-note 当前不承诺原生 Windows 支持。项目的安装、运行、批量导入和 Skill 命令映射依赖 `bash`、`find`、`cp`、`source venv/bin/activate` 等 POSIX 环境能力，因此 Windows 上推荐通过 **WSL2 + Ubuntu** 使用。
+
+给 OpenClaw / WorkBuddy 的执行原则：
+
+1. 先确认用户允许安装 WSL2。WSL2 安装需要管理员 PowerShell，可能需要重启电脑。
+2. 在 PowerShell 管理员窗口执行：
+
+```powershell
+wsl --install -d Ubuntu
+```
+
+3. 重启后打开 Ubuntu，完成 Linux 用户名和密码初始化。
+4. 在 Ubuntu/WSL 内安装并运行 mini-note：
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip git
+git clone https://github.com/jiggersong/mini-note.git ~/mini-note
+cd ~/mini-note
+./install.sh
+./verify.sh --quick
+```
+
+5. 在 OpenClaw / WorkBuddy 中把 `MINI_NOTE_WORKSPACE` 配置为 WSL 路径，例如 `/home/<linux-user>/mini-note`，并让 Agent 在 WSL shell 中执行 `./run.sh ...` 和 `./import.sh ...`。
+
+不要把项目优先放在 `/mnt/c/Users/...` 下运行。微软建议 Linux 命令行项目放在 WSL 文件系统内，例如 `/home/<user>/Project`，这样文件 IO 性能和权限语义更稳定。
+
+详细步骤、资源成本、低配电脑限制建议见 [Windows + WSL2 使用指南](docs/windows-wsl.md)。
+
 ### 安装
 
 ```bash
