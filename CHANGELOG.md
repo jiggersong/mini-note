@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.2.1 (2026-05-14)
+
+批量导入磁盘空间预检 + PID 锁文件过期自动清理。
+
+### 磁盘空间预检
+- 新增 `check_import_disk_space()` — 导入前评估文件总大小与可用空间，预估需求 = 原始 × 2.0，保留 100MB 安全余量
+- 新增 `ingest precheck-disk` CLI 子命令（`--dir` / `--files`），返回结构化 JSON 含 `would_fit`
+- `--scan-inbox` 批量摄入前自动运行预检，空间不足返回 `DISK_SPACE_LOW` 错误码，`--force` 可跳过
+- `import.sh` 外部源导入使用 ×3.0 估算（含 inbox 副本），预检失败 fail-closed，`--force` 传递到 CLI
+
+### PID 锁文件过期清理
+- 锁文件格式从纯文本升级为 JSON（`pid` + `timestamp`），通过 `os.kill(pid, 0)` 判断持有进程是否存活
+- 进程存活 → 锁有效；进程死亡 → 自动清理；跨用户 PermissionError / 旧格式 → 回退到 mtime 超时
+- 删除-重建竞态窗口添加三重试循环；锁错误消息包含持有者 PID 用于排障
+- `maintenance cleanup` 集成过期锁清理，`unlink(missing_ok=True)` 防止并发异常
+- `lock_timeout_seconds` 从 `meta/config.yaml` 读取（替代硬编码 300 秒）
+- `large_file_queue` 复用 `pipeline._is_lock_stale`，消除双份维护
+
+### 其他
+- `check_import_disk_space` 的 `file_count` 仅统计实际存在的文件
+- `precheck-disk` 空目录返回值与正常路径 schema 一致（含 `available_bytes`、`safe_margin_bytes`）
+- `_is_lock_stale` 处理并发删除（`FileNotFoundError`）和损坏 pid 类型（`isinstance` 校验）
+
+### 测试
+- 新增 `tests/unit/test_lock_and_disk.py`（29 个用例），覆盖 PID 存活/死亡/EPERM/ESRCH、锁过期回退、竞态清理、磁盘预检、CLI DISK_SPACE_LOW
+
 ## v0.2.0 (2026-05-14)
 
 知识库文件限制收紧 + 大文件独立队列 + 两阶段提交消除并发竞态。

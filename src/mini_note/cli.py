@@ -64,7 +64,14 @@ def main(argv: list[str] | None = None) -> dict | list:
     ingest_p.add_argument("--owner", type=str, default="user-default")
     ingest_p.add_argument("--scope", type=str, default="shared")
     ingest_p.add_argument("--scan-inbox", action="store_true", default=False)
+    ingest_p.add_argument("--force", action="store_true", default=False)
     ingest_p.add_argument("--json", action="store_true", default=False)
+    ingest_sp = ingest_p.add_subparsers(dest="ingest_command")
+    precheck_p = ingest_sp.add_parser("precheck-disk", help="评估导入文件的磁盘空间需求")
+    precheck_p.add_argument("--workspace", type=Path, default=Path.cwd())
+    precheck_p.add_argument("--dir", type=Path, default=None)
+    precheck_p.add_argument("--files", type=Path, nargs="*", default=None)
+    precheck_p.add_argument("--json", action="store_true", default=False)
 
     # ingest-large
     il_p = subparsers.add_parser("ingest-large", help="大文件队列管理")
@@ -289,6 +296,9 @@ def _cmd_lint(args: argparse.Namespace) -> dict:
 def _cmd_ingest(args: argparse.Namespace) -> dict:
     from mini_note.ingest.pipeline import IngestPipeline
 
+    if args.ingest_command == "precheck-disk":
+        return _cmd_precheck_disk(args)
+
     if args.scan_inbox:
         return _cmd_ingest_scan(args)
 
@@ -320,22 +330,99 @@ def _cmd_ingest(args: argparse.Namespace) -> dict:
     return out
 
 
+def _cmd_precheck_disk(args: argparse.Namespace) -> dict:
+    """评估导入文件的磁盘空间需求。"""
+    from mini_note.ingest.pipeline import check_import_disk_space
+
+    ws: Path = args.workspace
+
+    # 收集文件路径
+    file_paths: list[Path] = []
+    if args.dir:
+        src_dir = args.dir
+        if not src_dir.is_dir():
+            return _error_result(
+                error_code="INVALID_INPUT",
+                message=f"目录不存在: {src_dir}",
+                retryable=False,
+            )
+        for f in src_dir.rglob("*"):
+            if f.is_file() and not f.name.startswith(".") and not f.name.endswith(".gitkeep"):
+                file_paths.append(f)
+    elif args.files:
+        for f in args.files:
+            if f.is_file():
+                file_paths.append(f)
+            else:
+                return _error_result(
+                    error_code="INVALID_INPUT",
+                    message=f"文件不存在: {f}",
+                    retryable=False,
+                )
+    else:
+        return _error_result(
+            error_code="MISSING_INPUT",
+            message="请指定 --dir 或 --files",
+            retryable=False,
+        )
+
+    if not file_paths:
+        import shutil
+        usage = shutil.disk_usage(ws)
+        return {
+            "ok": True,
+            "file_count": 0,
+            "total_size_bytes": 0,
+            "available_bytes": usage.free,
+            "estimated_need_bytes": 0,
+            "safe_margin_bytes": 100 * 1024 * 1024,
+            "would_fit": True,
+            "message": "没有可评估的文件",
+        }
+
+    return check_import_disk_space(ws, file_paths)
+
+
 def _cmd_ingest_scan(args: argparse.Namespace) -> dict:
-    """扫描 inbox 目录批量摄入。"""
-    from mini_note.ingest.pipeline import IngestPipeline
+    """扫描 inbox 目录批量摄入（含磁盘空间预检）。"""
+    from mini_note.ingest.pipeline import IngestPipeline, check_import_disk_space
 
     ws: Path = args.workspace
     inbox_dir = ws / "raw" / "inbox"
     if not inbox_dir.exists():
         return {"ok": True, "results": [], "message": "inbox 目录不存在"}
 
-    results = []
-    pipeline = IngestPipeline(ws)
+    # 收集待处理文件
+    pending_files = []
     for f in sorted(inbox_dir.rglob("*")):
         if not f.is_file():
             continue
         if f.name.startswith(".") or f.name.endswith(".gitkeep"):
             continue
+        pending_files.append(f)
+
+    if not pending_files:
+        return {"ok": True, "results": [], "message": "inbox 中没有待处理文件"}
+
+    # 磁盘空间预检
+    if not args.force:
+        disk_check = check_import_disk_space(ws, pending_files)
+        if not disk_check["would_fit"]:
+            return _error_result(
+                error_code="DISK_SPACE_LOW",
+                message=(
+                    f"磁盘空间不足：{disk_check['file_count']} 个文件 "
+                    f"（共 {disk_check['total_size_bytes'] / 1024 / 1024:.1f} MB），"
+                    f"预估需求 {disk_check['estimated_need_bytes'] / 1024 / 1024:.1f} MB，"
+                    f"当前可用 {disk_check['available_bytes'] / 1024 / 1024:.1f} MB。"
+                    f"使用 --force 可强制导入。"
+                ),
+                retryable=False,
+            )
+
+    results = []
+    pipeline = IngestPipeline(ws)
+    for f in pending_files:
         r = pipeline.run(
             file_path=f,
             owner_id=args.owner,
@@ -601,12 +688,17 @@ def _cmd_maintenance(args: argparse.Namespace) -> dict:
                 rel = str(d.relative_to(ws))
                 removed_dirs.append(rel)
 
+        # 清理过期锁文件
+        from mini_note.ingest.pipeline import _cleanup_stale_locks
+        cleaned_locks = _cleanup_stale_locks(ws)
+
         # 统计剩余快照
         remaining = sorted(staging.glob("*.tar.gz"))
         return {
             "ok": True,
             "staging_snapshots": len(remaining),
             "removed_dirs": removed_dirs,
+            "cleaned_locks": cleaned_locks,
         }
     return _error_result(
         error_code="UNKNOWN_COMMAND",

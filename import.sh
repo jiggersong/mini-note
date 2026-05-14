@@ -18,6 +18,7 @@ usage() {
     echo "选项:"
     echo "  --owner ID      文件归属（默认 user-default）"
     echo "  --scope SCOPE   可见范围 shared/private（默认 shared）"
+    echo "  --force         跳过磁盘空间预检，强制导入"
     echo "  --dry-run       仅列出文件，不执行导入"
     echo "  --help          显示帮助"
     echo ""
@@ -33,6 +34,7 @@ cd "$SCRIPT_DIR"
 
 # 参数解析
 DRY_RUN=false
+FORCE=false
 OWNER="user-default"
 SCOPE="shared"
 SRC_DIR=""
@@ -41,6 +43,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h) usage ;;
         --dry-run) DRY_RUN=true; shift ;;
+        --force) FORCE=true; shift ;;
         --owner) OWNER="$2"; shift 2 ;;
         --scope) SCOPE="$2"; shift 2 ;;
         -*) echo -e "${RED}未知选项: $1${NC}"; exit 1 ;;
@@ -102,6 +105,52 @@ if [ "$DRY_RUN" = true ]; then
     exit 0
 fi
 
+# 磁盘空间预检（外部源目录 → inbox 副本(1x) + 摄入输出(2x) = 3x 估算）
+if [ "$FORCE" = false ]; then
+    echo "--- 磁盘空间预检 ---"
+    PRECHECK=$(./run.sh ingest precheck-disk --dir "$SRC_DIR" --json 2>&1) || true
+    if [ -z "$PRECHECK" ]; then
+        echo -e "${RED}⚠ 磁盘预检执行失败，无法评估空间需求。${NC}"
+        echo "使用 --force 可跳过预检强制导入。"
+        exit 1
+    fi
+    # 提取评估数据；import.sh 估算 = 原始文件 × 3（含 inbox 副本）
+    ASSESSMENT=$(echo "$PRECHECK" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+total = d.get('total_size_bytes', 0)
+avail = d.get('available_bytes', 0)
+margin = d.get('safe_margin_bytes', 100*1024*1024)
+# 外部源导入：inbox 副本 + archive + extracted + index ≈ 3x
+est = total * 3
+fit = (avail - est) >= margin
+print(f'{d.get(\"file_count\",0)}|{total}|{avail}|{est}|{fit}')
+" 2>/dev/null)
+    if [ -z "$ASSESSMENT" ]; then
+        echo -e "${RED}⚠ 无法解析预检结果。${NC}"
+        echo "使用 --force 可跳过预检强制导入。"
+        exit 1
+    fi
+    IFS='|' read -r FC TOTAL_SZ AVAIL_SZ EST_SZ WOULD_FIT <<< "$ASSESSMENT"
+
+    fmt_bytes() {
+        python3 -c "print(f'{$1 / 1024 / 1024:.1f} MB')"
+    }
+    echo "  文件数: $FC"
+    echo "  文件总大小: $(fmt_bytes $TOTAL_SZ)"
+    echo "  预估需求(inbox副本+摄入): $(fmt_bytes $EST_SZ)"
+    echo "  当前可用: $(fmt_bytes $AVAIL_SZ)"
+
+    if [ "$WOULD_FIT" = "False" ]; then
+        echo ""
+        echo -e "${RED}⚠ 磁盘空间不足，导入后可用空间可能低于安全余量。${NC}"
+        echo "使用 --force 可跳过预检强制导入。"
+        exit 1
+    fi
+    echo "磁盘空间充足，可以导入。"
+    echo ""
+fi
+
 # 复制到 inbox
 echo "--- 复制文件到 inbox ---"
 INBOX_DIR="$SCRIPT_DIR/raw/inbox/users"
@@ -133,11 +182,16 @@ echo "--- 执行批量摄入 ---"
 if [ -f venv/bin/activate ]; then
     source venv/bin/activate
 fi
+FORCE_FLAG=""
+if [ "$FORCE" = true ]; then
+    FORCE_FLAG="--force"
+fi
 PYTHONPATH="$SCRIPT_DIR/src" python3 -m mini_note.cli ingest \
     --workspace "$SCRIPT_DIR" \
     --scan-inbox \
     --owner "$OWNER" \
     --scope "$SCOPE" \
+    $FORCE_FLAG \
     --json
 
 echo ""

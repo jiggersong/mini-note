@@ -1,5 +1,8 @@
 """Ingest Pipeline — 摄入文件的全流程编排（CLI 的确定性部分）。"""
 
+import json
+import os
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -320,36 +323,150 @@ def _gen_operation_id() -> str:
     return f"op-{now.strftime('%Y%m%d')}-{now.strftime('%H%M%S')}-{secrets.token_hex(2)}"
 
 
+def _is_pid_alive(pid: int) -> bool:
+    """检查指定 PID 的进程是否仍在运行（跨平台）。
+
+    仅捕获 ProcessLookupError（进程不存在）。
+    PermissionError 向上抛出，由调用方回退到 mtime 判断。
+    """
+    try:
+        os.kill(pid, 0)  # 不发送信号，仅检测进程存在性
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def _is_lock_stale(lock_file: Path, timeout_seconds: int) -> bool:
+    """判断锁文件是否过期。
+
+    优先级：
+    1. 读取锁文件 JSON 中的 PID，通过 os.kill(pid, 0) 判断进程存活
+    2. PID 不存在 → 过期
+    3. PermissionError（跨用户）→ 回退到 mtime 超时判断
+    4. JSON 解析失败（旧格式锁）→ 回退到 mtime 超时判断
+    """
+    try:
+        raw = lock_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        pid = data.get("pid")
+        if isinstance(pid, int) and pid > 0:
+            try:
+                if _is_pid_alive(pid):
+                    return False  # 进程仍存活，锁有效
+                return True  # 进程已死，锁过期
+            except PermissionError:
+                pass  # 跨用户无法检测，回退到 mtime
+            except (TypeError, ValueError):
+                pass  # pid 类型异常，回退到 mtime
+    except FileNotFoundError:
+        return True  # 锁文件在读之前被并发删除，视为过期
+    except (json.JSONDecodeError, ValueError, KeyError):
+        pass  # 旧格式或损坏 JSON，回退到 mtime
+
+    # 回退：基于 mtime 的超时判断
+    age = datetime.now().timestamp() - lock_file.stat().st_mtime
+    return age >= timeout_seconds
+
+
 def _acquire_lock(workspace: Path) -> None:
-    """用 O_CREAT|O_EXCL 原子创建锁文件，避免检查-then-写入竞态。"""
-    import os
+    """用 O_CREAT|O_EXCL 原子创建 PID 锁文件。
+
+    锁文件内容为 JSON：{"pid": <pid>, "timestamp": "<iso8601>"}
+    遇到已有锁时，通过 PID 存活检测判断是否过期。
+    """
+    from mini_note.config import get_lock_timeout
 
     lock_file = workspace / ".state" / "ingest.lock"
     lock_file.parent.mkdir(parents=True, exist_ok=True)
+    timeout_seconds = get_lock_timeout(workspace)
 
-    def _lock_fd(lock_file: Path) -> None:
+    def _write_lock(lock_file: Path) -> None:
         fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         try:
-            os.write(fd, b"locked")
+            payload = json.dumps({
+                "pid": os.getpid(),
+                "timestamp": datetime.now(CST).isoformat(),
+            })
+            os.write(fd, payload.encode("utf-8"))
         finally:
             os.close(fd)
 
-    try:
-        _lock_fd(lock_file)
-    except FileExistsError:
-        # 锁已存在，检查是否超时（> 5 分钟自动释放）
-        age = datetime.now().timestamp() - lock_file.stat().st_mtime
-        if age < 300:
-            raise RuntimeError("已有 ingest 操作正在执行")
-        # 超时，强制获取
-        os.remove(lock_file)
-        _lock_fd(lock_file)
+    for _ in range(3):
+        try:
+            _write_lock(lock_file)
+            return
+        except FileExistsError:
+            if _is_lock_stale(lock_file, timeout_seconds):
+                try:
+                    os.remove(lock_file)
+                except FileNotFoundError:
+                    pass  # 已被其他并发进程清理
+                continue  # 重试创建
+            # 锁有效，读取持有者 PID 以提供排查信息
+            holder_pid = "unknown"
+            try:
+                data = json.loads(lock_file.read_text(encoding="utf-8"))
+                holder_pid = str(data.get("pid", "unknown"))
+            except Exception:
+                pass
+            raise RuntimeError(f"已有 ingest 操作正在执行 (PID={holder_pid})")
+
+    raise RuntimeError("获取 ingest 锁超时，系统繁忙")
 
 
 def _release_lock(workspace: Path) -> None:
     lock_file = workspace / ".state" / "ingest.lock"
     if lock_file.exists():
         lock_file.unlink()
+
+
+def _cleanup_stale_locks(workspace: Path) -> list[str]:
+    """清理过期的锁文件，返回已清理的锁文件路径列表。"""
+    from mini_note.config import get_lock_timeout
+
+    timeout_seconds = get_lock_timeout(workspace)
+    cleaned = []
+    for lock_name in ("ingest.lock", "large_ingest.lock"):
+        lock_file = workspace / ".state" / lock_name
+        if lock_file.exists() and _is_lock_stale(lock_file, timeout_seconds):
+            lock_file.unlink(missing_ok=True)
+            cleaned.append(str(lock_file.relative_to(workspace)))
+    return cleaned
+
+
+def check_import_disk_space(workspace: Path, file_paths: list[Path]) -> dict:
+    """评估导入文件对磁盘空间的需求。
+
+    Args:
+        workspace: 工作区根目录
+        file_paths: 待导入文件路径列表
+
+    Returns:
+        {"ok": bool, "file_count": int, "total_size_bytes": int,
+         "available_bytes": int, "estimated_need_bytes": int,
+         "safe_margin_bytes": int, "would_fit": bool}
+    """
+    SAFE_MARGIN_BYTES = 100 * 1024 * 1024  # 100MB 安全余量
+
+    actual_files = [f for f in file_paths if f.is_file()]
+    total_size = sum(f.stat().st_size for f in actual_files)
+    # 保守估计：原始文件 × 2.0（提取文本 + YAML 元数据 + SQLite 索引 + archive 副本）
+    estimated_need = int(total_size * 2.0)
+
+    usage = shutil.disk_usage(workspace)
+    available = usage.free
+
+    would_fit = (available - estimated_need) >= SAFE_MARGIN_BYTES
+
+    return {
+        "ok": True,
+        "file_count": len(actual_files),
+        "total_size_bytes": total_size,
+        "available_bytes": available,
+        "estimated_need_bytes": estimated_need,
+        "safe_margin_bytes": SAFE_MARGIN_BYTES,
+        "would_fit": would_fit,
+    }
 
 
 def _build_claims(source_id: str, content: str, ext: str) -> list[dict]:

@@ -69,6 +69,21 @@ def get_limits(workspace: Path | None = None) -> Limits:
     return limits
 
 
+def get_lock_timeout(workspace: Path | None = None) -> int:
+    """从 meta/config.yaml 读取 lock_timeout_seconds，默认 300 秒。"""
+    config_path = _find_config(workspace)
+    if config_path is None:
+        return 300
+    try:
+        import yaml
+        data = yaml.safe_load(config_path.read_text())
+        if data and "lock_timeout_seconds" in data:
+            return int(data["lock_timeout_seconds"])
+    except Exception:
+        pass
+    return 300
+
+
 def _find_config(workspace: Path | None) -> Path | None:
     """定位 meta/config.yaml。"""
     if workspace is not None:

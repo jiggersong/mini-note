@@ -10,6 +10,7 @@
 大文件 worker 使用独立锁 .state/large_ingest.lock，不与普通 ingest 互斥。
 """
 
+import json
 import os
 import secrets
 import shutil
@@ -124,19 +125,37 @@ def status(workspace: Path) -> dict:
 
 
 def acquire_large_worker_lock(workspace: Path) -> bool:
-    """尝试获取大文件 worker 锁（O_EXCL 原子操作）。
+    """尝试获取大文件 worker 锁（O_EXCL 原子操作，含 PID 过期检测）。
 
-    返回 True 表示获取成功，False 表示已有 worker 在运行。
+    返回 True 表示获取成功，False 表示已有 worker 在运行且未过期。
     """
+    from mini_note.config import get_lock_timeout
+    from mini_note.ingest.pipeline import _is_lock_stale
+
     lock_file = workspace / ".state" / "large_ingest.lock"
     lock_file.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, b"large_worker")
-        os.close(fd)
-        return True
-    except FileExistsError:
-        return False
+    timeout_seconds = get_lock_timeout(workspace)
+
+    for _ in range(3):
+        try:
+            fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            payload = json.dumps({
+                "pid": os.getpid(),
+                "timestamp": datetime.now(CST).isoformat(),
+            })
+            os.write(fd, payload.encode("utf-8"))
+            os.close(fd)
+            return True
+        except FileExistsError:
+            if _is_lock_stale(lock_file, timeout_seconds):
+                try:
+                    os.remove(lock_file)
+                except FileNotFoundError:
+                    pass  # 已被其他并发进程清理
+                continue  # 重试创建
+            return False
+
+    return False  # 重试耗尽
 
 
 def release_large_worker_lock(workspace: Path) -> None:
