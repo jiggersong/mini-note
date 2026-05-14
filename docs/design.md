@@ -30,7 +30,7 @@
 | 模型能力 | 可使用 OpenClaw 配置的 DeepSeekV4 pro 和 Qwen 3.5-plus |
 | 部署资源 | 参考阿里云个人 ECS，2C4G 到 4C8G，无 GPU |
 | 默认协作模型 | 不要求具体团队定义；多人场景通过 `owner_id` 区分操作者，默认共享空间为 `shared` |
-| 文件上限 | 默认采用 `PDF <= 100 页`、`Office <= 20MB`、`文本 <= 2MB`，后续保留配置化能力 |
+| 文件上限 | 默认采用 `PDF <= 40 页`、`Office <= 10MB`、`文本 <= 2MB`、`图片 <= 20MB`、`音频 <= 10 分钟`、`视频 <= 5 分钟`，通过 `meta/config.yaml` 可配置 |
 | OpenClaw 接口形态 | 采用 Skill 编排 + 本地 CLI，OpenClaw 负责模型调用与决策，mini-note CLI 负责确定性状态变更与校验 |
 
 ---
@@ -200,6 +200,7 @@ created_at: "2026-05-13T12:00:00+08:00"
 - `full`：已完整解析。
 - `partial`：只解析部分内容。
 - `metadata_only`：只记录元数据和简短描述。
+- `queued_large_file`：已进入大文件后台队列，尚未完成抽取。
 - `failed`：解析失败，保留失败原因。
 
 ### 7.2 Extraction
@@ -342,17 +343,20 @@ SQLite 不保存唯一事实，只保存可重建索引和任务状态。
 ### 9.1 主流程
 
 ```text
-1. Acquire lock                          [CLI]
-2. Register source                       [CLI]
-3. Extract content                       [CLI]
-4. Build evidence map                    [CLI]
-5. Skill calls LLM to analyze            [Skill → LLM]
-6. Skill generates change plan (JSON)    [Skill → LLM]
-7. CLI validates change plan             [CLI]
-8. CLI applies staged changes            [CLI]
-9. Rebuild derived index                 [CLI]
-10. Health check                         [CLI]
-11. Emit review tasks                    [CLI]
+0. Pre-check file size/type                [CLI]
+   ├─ 普通文件 → 继续
+   └─ 超限大文件 → 入队 large_ingest_queue，返回 queued_large_file
+1. Acquire lock                            [CLI]
+2. Register source                         [CLI]
+3. Extract content                         [CLI]
+4. Build evidence map                      [CLI]
+5. Skill calls LLM to analyze              [Skill → LLM]
+6. Skill generates change plan (JSON)      [Skill → LLM]
+7. CLI validates change plan               [CLI]
+8. CLI applies staged changes              [CLI]
+9. Rebuild derived index                   [CLI]
+10. Health check                           [CLI]
+11. Emit review tasks                      [CLI]
 ```
 
 备份由独立的 `backup create` 命令执行，每日 cron 触发，不耦合在 ingest 流程中（见 §14）。
@@ -361,9 +365,10 @@ SQLite 不保存唯一事实，只保存可重建索引和任务状态。
 
 | 步骤 | 行为 | 失败处理 |
 |---|---|---|
+| Pre-check file | 轻量检查文件大小/页数/时长，超限则入队大文件队列 | 超限入队 `.state/large_ingest_queue/pending/` |
 | Acquire lock | 创建单写锁 | 已有锁且未超时则拒绝写入 |
 | Register source | 计算 SHA256，生成 `source_id` | 重复 hash 跳过编译或追加引用 |
-| Extract content | 解析文本、图片描述、元数据 | 标记 `failed` 或 `metadata_only` |
+| Extract content | 解析文本、图片描述、元数据（遵循 limits 截断） | 标记 `failed` 或 `metadata_only` |
 | Build evidence map | 生成关键 claim | 无 claim 时只建 source page |
 | Skill calls LLM to analyze | OpenClaw Skill 组装 prompt（purpose/schema/index/overview/extracted），调用模型分析 | 失败后 job pending，Skill 稍后重试 |
 | Skill generates change plan | Skill 驱动 LLM 输出 JSON 变更计划，传回 CLI | JSON schema 校验失败则 Skill 重试一次 |
@@ -373,7 +378,26 @@ SQLite 不保存唯一事实，只保存可重建索引和任务状态。
 | Health check | 检查 Wiki 健康 | 严重失败则生成 review task |
 | Emit review tasks | 生成审核任务 | OpenClaw 后续处理 |
 
-### 9.3 成功标准
+### 9.3 大文件独立队列
+
+超过普通摄入上限的大文件不进入常规管线，而是写入独立队列由单 worker 后台处理，避免阻塞普通小文件的摄入。
+
+队列目录：`.state/large_ingest_queue/{pending,running,done,failed}/`
+
+约束：
+- 大文件 worker 使用独立锁 `.state/large_ingest.lock`，不与普通 ingest 互斥。
+- 同时最多 1 个大文件 worker 运行。
+- 大文件处理结果与普通管线格式兼容，状态明确为 `partial` 或 `metadata_only`。
+
+CLI 命令：
+```bash
+./run.sh ingest --file LARGE.pdf    # 超限自动入队，返回 queued_large_file
+./run.sh ingest-large enqueue --file PATH --owner USER  # 手动入队
+./run.sh ingest-large worker --once                     # 单次消费
+./run.sh ingest-large status                            # 队列状态
+```
+
+### 9.4 成功标准
 
 | 标准 | 验证方式 |
 |---|---|
@@ -406,10 +430,10 @@ SQLite 不保存唯一事实，只保存可重建索引和任务状态。
 | 类型 | 上限 | 超限处理 |
 |---|---|---|
 | 文本 | 2MB | partial |
-| PDF | 100 页 | partial |
-| Office | 20MB | metadata_only 或 partial |
+| PDF | 40 页 | partial |
+| Office | 10MB | metadata_only 或 partial |
 | 图片 | 20MB | metadata_only |
-| 音频 | 30 分钟 | metadata_only，后置转写 |
+| 音频 | 10 分钟 | metadata_only，后置转写 |
 | 视频 | 5 分钟 | metadata_only，后置抽帧 |
 
 ---
@@ -917,7 +941,7 @@ oss2>=2.18
 - OSS bucket：复用 OpenClaw 已有 OSS bucket。
 - OSS 快照加密：推荐客户端加密（生产环境应配置 `OSS_ENCRYPTION_KEY`）。
 - 默认团队 scope：不要求具体团队定义，默认共享空间为 `shared`，多人通过 `owner_id` 区分。
-- 文件上限：采用当前默认值（`PDF <= 100 页`、`Office <= 20MB`、`文本 <= 2MB`），并保留配置化能力。
+- 文件上限：采用当前默认值（`PDF <= 40 页`、`Office <= 10MB`、`文本 <= 2MB`），并保留配置化能力。
 - OpenClaw 接口形态：采用 Skill 编排 + 本地 CLI，OpenClaw 负责模型调用与决策，mini-note CLI 负责确定性状态变更与校验。
 
 ---

@@ -83,6 +83,9 @@ class FTSIndex:
                 path,
                 title,
                 body,
+                scope UNINDEXED,
+                type UNINDEXED,
+                updated_at UNINDEXED,
                 tokenize='unicode61'
             )
         """)
@@ -110,24 +113,34 @@ class FTSIndex:
                 page_id = rel_path
                 title = md_file.stem
                 body = text
+                scope = "shared"
+                page_type = ""
+                updated_at = ""
                 if text.startswith("---"):
                     end = text.find("---", 3)
                     if end != -1:
                         import yaml
-                        fm = yaml.safe_load(text[3:end]) or {}
+                        try:
+                            fm = yaml.safe_load(text[3:end]) or {}
+                        except yaml.YAMLError:
+                            fm = {}
                         page_id = fm.get("page_id", rel_path)
                         title = fm.get("title", md_file.stem)
+                        scope = fm.get("scope", "shared")
+                        page_type = fm.get("type", "")
+                        updated_at = fm.get("updated_at", "")
                         body = text[end + 3:]
 
                 indexed_body = _to_bigrams(body)
 
-                rows.append((page_id, rel_path, title, indexed_body))
+                rows.append((page_id, rel_path, title, indexed_body, scope, page_type, updated_at))
             except Exception:
                 continue
 
         if rows:
             conn.executemany(
-                "INSERT INTO fts_pages (page_id, path, title, body) VALUES (?, ?, ?, ?)",
+                "INSERT INTO fts_pages (page_id, path, title, body, scope, type, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
 
@@ -161,7 +174,7 @@ class FTSIndex:
             )
 
     def search_pages(self, question: str, scope: str = "shared", limit: int = 10, offset: int = 0) -> list[dict]:
-        """FTS5 搜索页面，返回 rank 排序结果。"""
+        """FTS5 搜索页面，返回 rank 排序结果。scope 非 shared 时在 SQL 层过滤。"""
         query = tokenize_query(question)
         if not query.strip():
             return []
@@ -169,24 +182,41 @@ class FTSIndex:
         try:
             conn = sqlite3.connect(str(self.db_path))
             conn.row_factory = sqlite3.Row
-            cur = conn.execute(
-                """
-                SELECT page_id, path, title,
-                       snippet(fts_pages, 3, '<mark>', '</mark>', '...', 32) AS snippet,
-                       rank
-                FROM fts_pages
-                WHERE fts_pages MATCH ?
-                ORDER BY rank
-                LIMIT ? OFFSET ?
-                """,
-                (query, limit, offset),
-            )
+            if scope and scope != "shared":
+                cur = conn.execute(
+                    """
+                    SELECT page_id, path, title, scope, type, updated_at,
+                           snippet(fts_pages, 3, '<mark>', '</mark>', '...', 32) AS snippet,
+                           rank
+                    FROM fts_pages
+                    WHERE fts_pages MATCH ? AND scope = ?
+                    ORDER BY rank
+                    LIMIT ? OFFSET ?
+                    """,
+                    (query, scope, limit, offset),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    SELECT page_id, path, title, scope, type, updated_at,
+                           snippet(fts_pages, 3, '<mark>', '</mark>', '...', 32) AS snippet,
+                           rank
+                    FROM fts_pages
+                    WHERE fts_pages MATCH ?
+                    ORDER BY rank
+                    LIMIT ? OFFSET ?
+                    """,
+                    (query, limit, offset),
+                )
             results = []
             for row in cur:
                 results.append({
                     "page_id": row["page_id"],
                     "path": row["path"],
                     "title": row["title"],
+                    "scope": row["scope"],
+                    "type": row["type"],
+                    "updated_at": row["updated_at"],
                     "snippet": row["snippet"],
                     "rank": row["rank"],
                 })

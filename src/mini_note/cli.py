@@ -66,6 +66,23 @@ def main(argv: list[str] | None = None) -> dict | list:
     ingest_p.add_argument("--scan-inbox", action="store_true", default=False)
     ingest_p.add_argument("--json", action="store_true", default=False)
 
+    # ingest-large
+    il_p = subparsers.add_parser("ingest-large", help="大文件队列管理")
+    il_sp = il_p.add_subparsers(dest="ingest_large_command")
+    il_enqueue = il_sp.add_parser("enqueue", help="手动将文件加入大文件队列")
+    il_enqueue.add_argument("--workspace", type=Path, default=Path.cwd())
+    il_enqueue.add_argument("--file", type=Path, required=True)
+    il_enqueue.add_argument("--owner", type=str, default="user-default")
+    il_enqueue.add_argument("--scope", type=str, default="shared")
+    il_enqueue.add_argument("--json", action="store_true", default=False)
+    il_worker = il_sp.add_parser("worker", help="启动大文件 worker（单次处理一个任务）")
+    il_worker.add_argument("--workspace", type=Path, default=Path.cwd())
+    il_worker.add_argument("--once", action="store_true", default=True)
+    il_worker.add_argument("--json", action="store_true", default=False)
+    il_status = il_sp.add_parser("status", help="查看大文件队列状态")
+    il_status.add_argument("--workspace", type=Path, default=Path.cwd())
+    il_status.add_argument("--json", action="store_true", default=False)
+
     # query
     query_p = subparsers.add_parser("query", help="查询知识库")
     query_p.add_argument("--workspace", type=Path, default=Path.cwd())
@@ -177,6 +194,8 @@ def _dispatch(args: argparse.Namespace) -> dict | list:
         return _cmd_lint(args)
     elif cmd == "ingest":
         return _cmd_ingest(args)
+    elif cmd == "ingest-large":
+        return _cmd_ingest_large(args)
     elif cmd == "query":
         return _cmd_query(args)
     elif cmd == "index":
@@ -337,6 +356,30 @@ def _cmd_ingest_scan(args: argparse.Namespace) -> dict:
     return {"ok": True, "results": results}
 
 
+def _cmd_ingest_large(args: argparse.Namespace) -> dict:
+    ws: Path = args.workspace
+    cmd = args.ingest_large_command
+
+    if cmd == "enqueue":
+        from mini_note.ingest.large_file_queue import enqueue
+        op_id = enqueue(ws, args.file, args.owner, args.scope, "manual", "手动入队")
+        return {"ok": True, "operation_id": op_id, "message": "已加入大文件队列"}
+
+    elif cmd == "worker":
+        from mini_note.ingest.large_file_queue import run_large_worker
+        return run_large_worker(ws, once=True)
+
+    elif cmd == "status":
+        from mini_note.ingest.large_file_queue import status
+        return {"ok": True, **status(ws)}
+
+    return _error_result(
+        error_code="UNKNOWN_COMMAND",
+        message=f"未知 ingest-large 子命令: {cmd}",
+        retryable=False,
+    )
+
+
 def _cmd_query(args: argparse.Namespace) -> dict:
     from mini_note.query.engine import QueryEngine
     engine = QueryEngine(args.workspace)
@@ -379,7 +422,7 @@ def _cmd_backup(args: argparse.Namespace) -> dict:
                 "ok": True,
                 "mode": "local",
                 "skipped": True,
-                "message": "OSS 未配置，跳过备份",
+                "message": "OSS 未配置，本次没有创建远程备份。请不要把当前状态视为已容灾。",
             }
 
         # 有 OSS，创建快照并上传

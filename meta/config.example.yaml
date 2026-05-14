@@ -11,11 +11,11 @@ lock_timeout_seconds: 300
 
 # 文件上限（可覆盖 .env 中的设置）
 limits:
-  max_pdf_pages: 100
-  max_office_mb: 20
+  max_pdf_pages: 40
+  max_office_mb: 10
   max_text_mb: 2
   max_image_mb: 20
-  max_audio_minutes: 30
+  max_audio_minutes: 10
   max_video_minutes: 5
 
 # 备份保留策略

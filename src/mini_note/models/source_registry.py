@@ -45,12 +45,16 @@ class SourceRegistry:
         owner_id: str,
         scope: str = "shared",
         max_text_mb: int = 2,
-        max_pdf_pages: int = 100,
+        max_pdf_pages: int = 40,
+        max_office_mb: int = 10,
+        max_image_mb: int = 20,
+        max_audio_minutes: int = 10,
+        max_video_minutes: int = 5,
     ) -> str:
         """注册一个文件，返回 source_id。
 
         如果文件 SHA256 已存在，返回已有的 source_id 而不再归档。
-        如果文件超过大小限制，标记 ingestion_status 为 partial。
+        如果文件超过大小限制，标记 ingestion_status 为 partial 或 metadata_only。
         """
         sha = compute_sha256(path)
         size_bytes = path.stat().st_size
@@ -68,7 +72,15 @@ class SourceRegistry:
         # 确定文件类型和摄入状态
         ext = path.suffix.lower()
         media_type = self._guess_media_type(ext)
-        status = self._determine_status(path, size_bytes, max_text_mb)
+        status = self._determine_status(
+            path, size_bytes,
+            max_text_mb=max_text_mb,
+            max_pdf_pages=max_pdf_pages,
+            max_office_mb=max_office_mb,
+            max_image_mb=max_image_mb,
+            max_audio_minutes=max_audio_minutes,
+            max_video_minutes=max_video_minutes,
+        )
 
         # 复制原始文件
         dest_file = dest_dir / path.name
@@ -145,12 +157,59 @@ class SourceRegistry:
         return mapping.get(ext, "application/octet-stream")
 
     def _determine_status(
-        self, path: Path, size_bytes: int, max_text_mb: int
+        self,
+        path: Path,
+        size_bytes: int,
+        max_text_mb: int = 2,
+        max_pdf_pages: int = 40,
+        max_office_mb: int = 10,
+        max_image_mb: int = 20,
+        max_audio_minutes: int = 10,
+        max_video_minutes: int = 5,
     ) -> str:
-        """根据文件大小判断摄入状态。"""
+        """根据文件大小/类型判断摄入状态。"""
         ext = path.suffix.lower()
+
         if ext in (".md", ".txt"):
-            limit = max_text_mb * 1024 * 1024
-            if size_bytes > limit:
+            if size_bytes > max_text_mb * 1024 * 1024:
                 return "partial"
-        return "full"
+            return "full"
+
+        if ext == ".pdf":
+            try:
+                import pdfplumber
+                with pdfplumber.open(path) as pdf:
+                    if len(pdf.pages) > max_pdf_pages:
+                        return "partial"
+            except Exception:
+                pass
+            return "full"
+
+        office_exts = {".docx", ".xlsx", ".pptx"}
+        if ext in office_exts:
+            if size_bytes > max_office_mb * 1024 * 1024:
+                return "metadata_only"
+            return "full"
+
+        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".svg"}
+        if ext in image_exts:
+            if size_bytes > max_image_mb * 1024 * 1024:
+                return "metadata_only"
+            return "full"
+
+        audio_exts = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma"}
+        video_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv"}
+        if ext in audio_exts or ext in video_exts:
+            return "metadata_only"
+
+        # 代码文件：当前提取器可完整提取结构
+        code_exts = {
+            ".py", ".js", ".ts", ".go", ".java", ".rs", ".cpp", ".c", ".h",
+            ".sh", ".bash", ".yaml", ".yml", ".toml", ".json", ".xml", ".sql",
+            ".rb", ".php", ".swift", ".kt", ".scala",
+        }
+        if ext in code_exts:
+            return "full"
+
+        # 未知类型：与 extraction 行为一致，仅记录元数据
+        return "metadata_only"

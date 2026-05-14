@@ -192,3 +192,51 @@ class TestFileSizeLimit:
         source_yaml = tmp_workspace / "raw" / "archive" / sid / "source.yaml"
         content = source_yaml.read_text()
         assert "partial" in content
+
+
+# ============================================================
+# ingestion_status 覆盖
+# ============================================================
+
+class TestIngestionStatus:
+    """测试各文件类型的 ingestion_status 正确性。"""
+
+    def test_code_file_returns_full(self, tmp_workspace, tmp_path):
+        from mini_note.models.source_registry import SourceRegistry
+        import yaml
+
+        src = tmp_path / "script.py"; src.write_text("print('hello')")
+        registry = SourceRegistry(tmp_workspace)
+        sid = registry.register(src, owner_id="u")
+        data = yaml.safe_load((tmp_workspace / "raw" / "archive" / sid / "source.yaml").read_text())
+        assert data["ingestion_status"] == "full"
+
+    def test_unknown_extension_returns_metadata_only(self, tmp_workspace, tmp_path):
+        from mini_note.models.source_registry import SourceRegistry
+        import yaml
+
+        src = tmp_path / "data.xyz"; src.write_bytes(b"\x00\x01\x02")
+        registry = SourceRegistry(tmp_workspace)
+        sid = registry.register(src, owner_id="u")
+        data = yaml.safe_load((tmp_workspace / "raw" / "archive" / sid / "source.yaml").read_text())
+        assert data["ingestion_status"] == "metadata_only"
+
+    def test_audio_returns_metadata_only(self, tmp_workspace, tmp_path):
+        from mini_note.models.source_registry import SourceRegistry
+        import yaml
+
+        src = tmp_path / "podcast.mp3"; src.write_bytes(b"\xff\xfb\x90\x00" * 100)
+        registry = SourceRegistry(tmp_workspace)
+        sid = registry.register(src, owner_id="u")
+        data = yaml.safe_load((tmp_workspace / "raw" / "archive" / sid / "source.yaml").read_text())
+        assert data["ingestion_status"] == "metadata_only"
+
+    def test_text_within_limit_returns_full(self, tmp_workspace, tmp_path):
+        from mini_note.models.source_registry import SourceRegistry
+        import yaml
+
+        src = tmp_path / "note.txt"; src.write_text("short note")
+        registry = SourceRegistry(tmp_workspace)
+        sid = registry.register(src, owner_id="u", max_text_mb=2)
+        data = yaml.safe_load((tmp_workspace / "raw" / "archive" / sid / "source.yaml").read_text())
+        assert data["ingestion_status"] == "full"

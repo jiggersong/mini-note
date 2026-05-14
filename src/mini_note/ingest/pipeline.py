@@ -9,7 +9,7 @@ import yaml
 from mini_note.models.source_registry import SourceRegistry, generate_source_id, compute_sha256
 from mini_note.models.operation import OperationManifest
 from mini_note.models.claim import Claim
-from mini_note.ingest.extraction import extract_by_type
+from mini_note.ingest.extraction import extract_by_type, ExtractionResult
 from mini_note.ingest.staging import write_to_staging, apply_staged_changes
 from mini_note.indexer import Indexer
 
@@ -45,36 +45,29 @@ class IngestPipeline:
         file_path: Path,
         owner_id: str,
         scope: str = "shared",
+        skip_precheck: bool = False,
+        use_lock: bool = True,
+        pre_extracted: ExtractionResult | None = None,
     ) -> IngestResult:
         """执行摄入流程（不含 LLM 分析步骤）。
 
-        LLM 分析和变更计划生成由 OpenClaw Skill 完成，
-        此方法只执行 CLI 侧的确定性操作。
+        skip_precheck=True 时跳过预检分流（大文件 worker 使用）。
+        use_lock=False 时不获取 ingest.lock（调用方自行管理锁）。
+        pre_extracted 为 ExtractionResult 时跳过提取步骤，直接使用已有结果。
         """
         operation_id = _gen_operation_id()
         op = None
 
         try:
-            # 1. Acquire lock (MVP: 简化为文件锁)
-            _acquire_lock(self.workspace)
+            # 1. Acquire lock（大文件 worker 使用独立 large_ingest.lock）
+            if use_lock:
+                _acquire_lock(self.workspace)
 
-            # 安全检查：拒绝符号链接指向 workspace 外的文件
+            # 拒绝符号链接（symlink），防止指向敏感路径
             real_path = file_path.resolve()
-            try:
-                real_path.relative_to(self.workspace.resolve())
-            except ValueError:
-                # 文件不在 workspace 内，可能是外部文件或恶意路径
-                _release_lock(self.workspace)
-                return IngestResult(
-                    ok=False,
-                    error_code="PATH_TRAVERSAL",
-                    message="文件不在 workspace 内，路径穿越被拒绝",
-                    retryable=False,
-                )
-
-            # 拒绝符号链接（symlink）
             if file_path.is_symlink():
-                _release_lock(self.workspace)
+                if use_lock:
+                    _release_lock(self.workspace)
                 return IngestResult(
                     ok=False,
                     error_code="SYMLINK_REJECTED",
@@ -82,12 +75,36 @@ class IngestPipeline:
                     retryable=False,
                 )
 
+            # 加载限制配置
+            from mini_note.config import get_limits
+            limits = get_limits(self.workspace)
+
+            # 预检：大文件分流（大文件 worker 跳过此步）
+            if not skip_precheck:
+                precheck = _precheck_file(file_path, limits)
+                if precheck["is_large_file"]:
+                    if use_lock:
+                        _release_lock(self.workspace)
+                    from mini_note.ingest.large_file_queue import enqueue
+                    large_op_id = enqueue(
+                        self.workspace, file_path, owner_id, scope,
+                        precheck["limit_type"], precheck["actual_value"],
+                    )
+                    return IngestResult(
+                        ok=True,
+                        operation_id=large_op_id,
+                        ingestion_status="queued_large_file",
+                        backup_status="none",
+                        message=f"大文件已进入后台队列（{precheck['limit_type']}: {precheck['actual_value']}）",
+                    )
+
             # 2. 检查重复 — SHA256 已存在则跳过提取与 wiki 生成
             sha = compute_sha256(file_path)
             registry = SourceRegistry(self.workspace)
             existing_id = registry.find_by_sha256(sha)
             if existing_id:
-                _release_lock(self.workspace)
+                if use_lock:
+                    _release_lock(self.workspace)
                 return IngestResult(
                     ok=True,
                     operation_id=operation_id,
@@ -97,11 +114,22 @@ class IngestPipeline:
                     message="文件已存在，跳过重复摄入",
                 )
 
-            # 3. Register source
-            source_id = registry.register(file_path, owner_id=owner_id, scope=scope)
+            # 3. Register source（传入完整 limits）
+            source_id = registry.register(
+                file_path, owner_id=owner_id, scope=scope,
+                max_text_mb=limits.max_text_mb,
+                max_pdf_pages=limits.max_pdf_pages,
+                max_office_mb=limits.max_office_mb,
+                max_image_mb=limits.max_image_mb,
+                max_audio_minutes=limits.max_audio_minutes,
+                max_video_minutes=limits.max_video_minutes,
+            )
 
-            # 4. Extract content
-            ext_result = extract_by_type(file_path)
+            # 4. Extract content（传入 limits 以强制截断；pre_extracted 跳过）
+            if pre_extracted is not None:
+                ext_result = pre_extracted
+            else:
+                ext_result = extract_by_type(file_path, limits=limits)
 
             # 写入 extracted 目录
             ext_dir = self.workspace / "raw" / "extracted" / source_id
@@ -175,7 +203,8 @@ class IngestPipeline:
             op_file = op_dir / f"{operation_id}.yaml"
             op_file.write_text(_manifest_to_yaml(op), encoding="utf-8")
 
-            _release_lock(self.workspace)
+            if use_lock:
+                _release_lock(self.workspace)
 
             return IngestResult(
                 ok=True,
@@ -187,7 +216,8 @@ class IngestPipeline:
             )
 
         except Exception as e:
-            _release_lock(self.workspace)
+            if use_lock:
+                _release_lock(self.workspace)
             return IngestResult(
                 ok=False,
                 operation_id=operation_id,
@@ -200,6 +230,89 @@ class IngestPipeline:
 # ============================================================
 # 内部辅助函数
 # ============================================================
+
+def _precheck_file(file_path: Path, limits) -> dict:
+    """轻量预检文件是否超过摄入上限（不执行完整抽取）。
+
+    返回：
+        is_large_file: bool
+        limit_type: str   — 超限类型（text_mb / pdf_pages / office_mb / image_mb / audio_minutes / video_minutes）
+        actual_value: str  — 实际值（用于提示）
+    """
+    size_bytes = file_path.stat().st_size
+    ext = file_path.suffix.lower()
+
+    # 文本：检查文件大小
+    if ext in (".md", ".txt"):
+        if size_bytes > limits.max_text_bytes:
+            return {
+                "is_large_file": True,
+                "limit_type": "text_mb",
+                "actual_value": f"{size_bytes / 1024 / 1024:.1f}MB",
+            }
+
+    # Office：检查文件大小
+    if ext in (".docx", ".xlsx", ".pptx"):
+        if size_bytes > limits.max_office_bytes:
+            return {
+                "is_large_file": True,
+                "limit_type": "office_mb",
+                "actual_value": f"{size_bytes / 1024 / 1024:.1f}MB",
+            }
+
+    # 图片：检查文件大小
+    image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".svg"}
+    if ext in image_exts:
+        if size_bytes > limits.max_image_bytes:
+            return {
+                "is_large_file": True,
+                "limit_type": "image_mb",
+                "actual_value": f"{size_bytes / 1024 / 1024:.1f}MB",
+            }
+
+    # PDF：仅读页数（轻量，不抽文本）
+    if ext == ".pdf":
+        try:
+            import pdfplumber
+            with pdfplumber.open(file_path) as pdf:
+                pages = len(pdf.pages)
+            if pages > limits.max_pdf_pages:
+                return {
+                    "is_large_file": True,
+                    "limit_type": "pdf_pages",
+                    "actual_value": f"{pages} 页",
+                }
+        except Exception:
+            pass  # 无法读取 PDF 页数则放行，由提取层处理
+
+    # 音视频：仅读时长（轻量，mutagen 只读头部）
+    media_exts = {
+        ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac",
+        ".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv",
+    }
+    audio_exts = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma"}
+    if ext in media_exts:
+        try:
+            from mutagen import File as MutagenFile
+            mf = MutagenFile(str(file_path))
+            if mf is not None and hasattr(mf, "info") and mf.info:
+                duration_sec = mf.info.length
+                if ext in audio_exts and duration_sec > limits.max_audio_seconds:
+                    return {
+                        "is_large_file": True,
+                        "limit_type": "audio_minutes",
+                        "actual_value": f"{duration_sec / 60:.1f} 分钟",
+                    }
+                if ext not in audio_exts and duration_sec > limits.max_video_seconds:
+                    return {
+                        "is_large_file": True,
+                        "limit_type": "video_minutes",
+                        "actual_value": f"{duration_sec / 60:.1f} 分钟",
+                    }
+        except Exception:
+            pass  # 无法读取时长则放行
+
+    return {"is_large_file": False, "limit_type": "", "actual_value": ""}
 
 def _gen_operation_id() -> str:
     now = datetime.now(CST)
@@ -214,10 +327,15 @@ def _acquire_lock(workspace: Path) -> None:
     lock_file = workspace / ".state" / "ingest.lock"
     lock_file.parent.mkdir(parents=True, exist_ok=True)
 
-    try:
+    def _lock_fd(lock_file: Path) -> None:
         fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, b"locked")
-        os.close(fd)
+        try:
+            os.write(fd, b"locked")
+        finally:
+            os.close(fd)
+
+    try:
+        _lock_fd(lock_file)
     except FileExistsError:
         # 锁已存在，检查是否超时（> 5 分钟自动释放）
         age = datetime.now().timestamp() - lock_file.stat().st_mtime
@@ -225,9 +343,7 @@ def _acquire_lock(workspace: Path) -> None:
             raise RuntimeError("已有 ingest 操作正在执行")
         # 超时，强制获取
         os.remove(lock_file)
-        fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, b"locked")
-        os.close(fd)
+        _lock_fd(lock_file)
 
 
 def _release_lock(workspace: Path) -> None:

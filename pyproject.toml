@@ -4,7 +4,7 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "mini-note"
-version = "0.1.0"
+version = "0.2.0"
 description = "给 OpenClaw 用的笔记管理软件，参考 Karpathy LLM Wiki 理念实现，仅为个人使用"
 readme = "README.md"
 license = {text = "MIT"}

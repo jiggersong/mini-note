@@ -36,36 +36,59 @@ class ExtractionResult:
             self.created_at = datetime.now(CST).isoformat()
 
 
-def extract_markdown(path: Path) -> ExtractionResult:
-    """提取 Markdown 文件全文。"""
-    content = path.read_text(encoding="utf-8", errors="replace")
+def extract_markdown(path: Path, max_bytes: int | None = None) -> ExtractionResult:
+    """提取 Markdown 文件全文，超 max_bytes 则截断为 partial。"""
+    size = path.stat().st_size
+    if max_bytes and size > max_bytes:
+        with open(path, "rb") as f:
+            raw = f.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            raw = raw[:max_bytes]
+        status = "partial"
+        reason = f"文件超过 {max_bytes} 字节上限，仅提取前 {max_bytes} 字节"
+    else:
+        with open(path, "rb") as f:
+            raw = f.read()
+        status = "full"
+        reason = None
+    content = raw.decode("utf-8", errors="replace")
     return ExtractionResult(
         content=content,
         extractor="markdown-reader",
         extractor_version="1.0",
-        status="full",
-        coverage={"bytes_read": path.stat().st_size},
+        status=status,
+        coverage={"bytes_total": size, "bytes_read": len(raw), "reason": reason},
+        warnings=[reason] if reason else [],
     )
 
 
 def extract_text(path: Path, max_bytes: int | None = None) -> ExtractionResult:
-    """提取纯文本文件内容。支持 UTF-8 BOM。"""
-    raw = path.read_bytes()
+    """提取纯文本文件内容，超 max_bytes 则截断为 partial。支持 UTF-8 BOM。"""
+    size = path.stat().st_size
+    read_limit = (max_bytes + 1) if (max_bytes and size > max_bytes) else -1
+
+    # BOM 检测：先读前 3 字节
+    with open(path, "rb") as f:
+        if read_limit > 0:
+            raw = f.read(read_limit)
+        else:
+            raw = f.read()
 
     # 处理 BOM
+    bom_offset = 0
     if raw.startswith(b"\xef\xbb\xbf"):
-        raw = raw[3:]
+        bom_offset = 3
 
-    # 超限处理
-    if max_bytes and len(raw) > max_bytes:
-        raw = raw[:max_bytes]
+    # 超限截断（BOM 不计入内容字节数）
+    if max_bytes and len(raw) - bom_offset > max_bytes:
+        raw = raw[:max_bytes + bom_offset]
         status = "partial"
         reason = f"文件超过 {max_bytes} 字节上限，仅提取前 {max_bytes} 字节"
     else:
         status = "full"
         reason = None
 
-    content = raw.decode("utf-8", errors="replace")
+    content = raw[bom_offset:].decode("utf-8", errors="replace")
 
     return ExtractionResult(
         content=content,
@@ -73,15 +96,22 @@ def extract_text(path: Path, max_bytes: int | None = None) -> ExtractionResult:
         extractor_version="1.0",
         status=status,
         coverage={
-            "bytes_total": path.stat().st_size,
-            "bytes_read": len(raw),
+            "bytes_total": size,
+            "bytes_read": len(raw) - bom_offset,
             "reason": reason,
         },
     )
 
 
-def extract_docx(path: Path) -> ExtractionResult:
-    """提取 DOCX 文件段落、标题、表格文本。"""
+def extract_docx(path: Path, max_office_bytes: int | None = None) -> ExtractionResult:
+    """提取 DOCX 文件段落、标题、表格文本。超限返回 metadata_only。"""
+    if max_office_bytes and path.stat().st_size > max_office_bytes:
+        return ExtractionResult(
+            status="metadata_only",
+            extractor="python-docx",
+            extractor_version="1.x",
+            warnings=[f"文件超过 {max_office_bytes} 字节上限，仅保存元数据"],
+        )
     try:
         from docx import Document
     except ImportError:
@@ -130,8 +160,8 @@ def extract_docx(path: Path) -> ExtractionResult:
     )
 
 
-def extract_pdf(path: Path) -> ExtractionResult:
-    """提取 PDF 文件文本（pdfplumber）。"""
+def extract_pdf(path: Path, max_pages: int = 40) -> ExtractionResult:
+    """提取 PDF 文本，超 max_pages 则截断为 partial。"""
     try:
         import pdfplumber
     except ImportError:
@@ -144,18 +174,33 @@ def extract_pdf(path: Path) -> ExtractionResult:
 
     try:
         with pdfplumber.open(path) as pdf:
+            total_pages = len(pdf.pages)
             texts = []
-            for page in pdf.pages:
+            for page in pdf.pages[:max_pages]:
                 t = page.extract_text()
                 if t:
                     texts.append(t)
             content = "\n\n".join(texts)
-            status = "metadata_only" if not content.strip() else "full"
+            if total_pages > max_pages:
+                status = "partial"
+                reason = f"PDF {total_pages} 页超过上限 {max_pages} 页，仅提取前 {max_pages} 页"
+            elif not content.strip():
+                status = "metadata_only"
+                reason = None
+            else:
+                status = "full"
+                reason = None
         return ExtractionResult(
             content=content,
             extractor="pdfplumber",
             extractor_version="0.11.x",
             status=status,
+            coverage={
+                "pages_total": total_pages,
+                "pages_processed": min(total_pages, max_pages),
+                "reason": reason,
+            },
+            warnings=[reason] if reason else [],
         )
     except Exception as e:
         return ExtractionResult(
@@ -166,8 +211,15 @@ def extract_pdf(path: Path) -> ExtractionResult:
         )
 
 
-def extract_xlsx(path: Path) -> ExtractionResult:
-    """提取 XLSX 文件所有 sheet 的表格数据为 Markdown 表格。"""
+def extract_xlsx(path: Path, max_office_bytes: int | None = None) -> ExtractionResult:
+    """提取 XLSX 文件所有 sheet 的表格数据为 Markdown 表格。超限返回 metadata_only。"""
+    if max_office_bytes and path.stat().st_size > max_office_bytes:
+        return ExtractionResult(
+            status="metadata_only",
+            extractor="openpyxl",
+            extractor_version="3.x",
+            warnings=[f"文件超过 {max_office_bytes} 字节上限，仅保存元数据"],
+        )
     try:
         from openpyxl import load_workbook
     except ImportError:
@@ -218,8 +270,15 @@ def extract_xlsx(path: Path) -> ExtractionResult:
     )
 
 
-def extract_pptx(path: Path) -> ExtractionResult:
-    """提取 PPTX 文件所有幻灯片的文本和表格。"""
+def extract_pptx(path: Path, max_office_bytes: int | None = None) -> ExtractionResult:
+    """提取 PPTX 文件所有幻灯片的文本和表格。超限返回 metadata_only。"""
+    if max_office_bytes and path.stat().st_size > max_office_bytes:
+        return ExtractionResult(
+            status="metadata_only",
+            extractor="python-pptx",
+            extractor_version="0.6.x",
+            warnings=[f"文件超过 {max_office_bytes} 字节上限，仅保存元数据"],
+        )
     try:
         from pptx import Presentation
     except ImportError:
@@ -264,8 +323,16 @@ def extract_pptx(path: Path) -> ExtractionResult:
     )
 
 
-def extract_image(path: Path) -> ExtractionResult:
-    """提取图片元数据（尺寸、格式、模式）。"""
+def extract_image(path: Path, max_image_bytes: int | None = None) -> ExtractionResult:
+    """提取图片元数据（尺寸、格式、模式）。超限返回 metadata_only。"""
+    if max_image_bytes and path.stat().st_size > max_image_bytes:
+        return ExtractionResult(
+            status="metadata_only",
+            extractor="pillow",
+            extractor_version="10.x",
+            warnings=[f"图片超过 {max_image_bytes} 字节上限，仅保存元数据"],
+            coverage={"size_bytes": path.stat().st_size},
+        )
     try:
         from PIL import Image
     except ImportError:
@@ -366,7 +433,11 @@ def _parse_python(text: str) -> str:
                 doc = ast.get_docstring(node)
                 parts.append(f"- **函数**: `def {node.name}({', '.join(args)})`")
                 if doc:
-                    parts.append(f"  - 说明: {doc.split(chr(10))[0][:80]}")
+                    first_line = next(
+                        (ln for ln in doc.strip().splitlines() if ln.strip()), ""
+                    )
+                    if first_line:
+                        parts.append(f"  - 说明: {first_line[:80]}")
             elif isinstance(node, ast.AsyncFunctionDef):
                 args = [a.arg for a in node.args.args]
                 parts.append(f"- **异步函数**: `async def {node.name}({', '.join(args)})`")
@@ -376,7 +447,11 @@ def _parse_python(text: str) -> str:
                 parts.append(f"- **类**: `class {node.name}{base_str}`")
                 doc = ast.get_docstring(node)
                 if doc:
-                    parts.append(f"  - 说明: {doc.split(chr(10))[0][:80]}")
+                    first_line = next(
+                        (ln for ln in doc.strip().splitlines() if ln.strip()), ""
+                    )
+                    if first_line:
+                        parts.append(f"  - 说明: {first_line[:80]}")
                 for body_node in node.body:
                     if isinstance(body_node, ast.FunctionDef):
                         a = [a.arg for a in body_node.args.args]
@@ -416,16 +491,32 @@ def _parse_generic_code(text: str, ext: str) -> str:
     return "\n".join(parts) if parts else "（无识别到的代码结构）"
 
 
-def extract_media(path: Path) -> ExtractionResult:
-    """提取音视频文件的元数据。
+def extract_media(path: Path, max_audio_seconds: int | None = None, max_video_seconds: int | None = None) -> ExtractionResult:
+    """提取音视频文件的元数据，超时长的仅作标记。
 
     优先尝试 mutagen（纯 Python），如失败则回退到文件基本信息。
     """
     ext = path.suffix.lower()
     size = path.stat().st_size
+    audio_exts = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma"}
+    video_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv"}
 
     # 尝试用 mutagen 提取标签
     metadata = _try_mutagen(path)
+    warnings: list[str] = []
+
+    # 时长检查
+    if metadata and "时长" in metadata:
+        duration_str = metadata["时长"]
+        import re
+        dur_match = re.match(r"([\d.]+)", duration_str)
+        if dur_match:
+            duration_sec = float(dur_match.group(1))
+            if ext in audio_exts and max_audio_seconds and duration_sec > max_audio_seconds:
+                warnings.append(f"音频时长 {duration_sec:.0f} 秒超过上限 {max_audio_seconds} 秒，后置转写需单 worker 处理")
+            elif ext in video_exts and max_video_seconds and duration_sec > max_video_seconds:
+                warnings.append(f"视频时长 {duration_sec:.0f} 秒超过上限 {max_video_seconds} 秒，后置抽帧需单 worker 处理")
+
     if metadata:
         content = "## 音视频元数据\n\n| 属性 | 值 |\n|------|-----|\n"
         for k, v in metadata.items():
@@ -436,11 +527,10 @@ def extract_media(path: Path) -> ExtractionResult:
             extractor_version="1.x",
             status="metadata_only",
             coverage=metadata,
+            warnings=warnings,
         )
 
     # 回退：仅文件基本信息
-    audio_exts = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma"}
-    video_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv"}
     kind = "音频" if ext in audio_exts else "视频" if ext in video_exts else "未知"
 
     content = f"""## 媒体文件基本信息
@@ -458,6 +548,7 @@ def extract_media(path: Path) -> ExtractionResult:
         extractor_version="1.0",
         status="metadata_only",
         coverage={"kind": kind, "size_bytes": size, "extension": ext},
+        warnings=warnings,
     )
 
 
@@ -509,28 +600,49 @@ def _try_mutagen(path: Path) -> dict | None:
         return None
 
 
-def extract_by_type(path: Path, max_bytes: int | None = None) -> ExtractionResult:
-    """根据文件扩展名自动选择提取器。"""
+def extract_by_type(path: Path, limits=None, max_bytes: int | None = None) -> ExtractionResult:
+    """根据文件扩展名自动选择提取器。
+
+    limits 为 mini_note.config.Limits 对象（可选），用于强制超限截断。
+    max_bytes 保留向后兼容：传入时覆盖 limits.max_text_bytes。
+    """
     if not path.exists():
         raise FileNotFoundError(f"文件不存在: {path}")
 
+    # 解析 limits（优先使用显式 max_bytes，否则从 limits 对象取）
+    _max_text_bytes = max_bytes
+    _max_pdf_pages = 40
+    _max_office_bytes = 10 * 1024 * 1024
+    _max_image_bytes = 20 * 1024 * 1024
+    _max_audio_seconds = 10 * 60
+    _max_video_seconds = 5 * 60
+    if limits is not None:
+        if _max_text_bytes is None:
+            _max_text_bytes = limits.max_text_bytes
+        _max_pdf_pages = limits.max_pdf_pages
+        _max_office_bytes = limits.max_office_bytes
+        _max_image_bytes = limits.max_image_bytes
+        _max_audio_seconds = limits.max_audio_seconds
+        _max_video_seconds = limits.max_video_seconds
+
     ext = path.suffix.lower()
 
-    extractors = {
-        ".md": extract_markdown,
-        ".txt": lambda p: extract_text(p, max_bytes=max_bytes),
-        ".docx": extract_docx,
-        ".pdf": extract_pdf,
-        ".xlsx": extract_xlsx,
-        ".pptx": extract_pptx,
-    }
-
-    if ext in extractors:
-        return extractors[ext](path)
+    if ext == ".md":
+        return extract_markdown(path, max_bytes=_max_text_bytes)
+    if ext == ".txt":
+        return extract_text(path, max_bytes=_max_text_bytes)
+    if ext == ".docx":
+        return extract_docx(path, max_office_bytes=_max_office_bytes)
+    if ext == ".pdf":
+        return extract_pdf(path, max_pages=_max_pdf_pages)
+    if ext == ".xlsx":
+        return extract_xlsx(path, max_office_bytes=_max_office_bytes)
+    if ext == ".pptx":
+        return extract_pptx(path, max_office_bytes=_max_office_bytes)
 
     image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".svg"}
     if ext in image_exts:
-        return extract_image(path)
+        return extract_image(path, max_image_bytes=_max_image_bytes)
 
     code_exts = {
         ".py", ".js", ".ts", ".go", ".java", ".rs", ".cpp", ".c", ".h",
@@ -545,7 +657,7 @@ def extract_by_type(path: Path, max_bytes: int | None = None) -> ExtractionResul
         ".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv",
     }
     if ext in media_exts:
-        return extract_media(path)
+        return extract_media(path, max_audio_seconds=_max_audio_seconds, max_video_seconds=_max_video_seconds)
 
     return ExtractionResult(
         status="metadata_only",

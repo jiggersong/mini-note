@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.2.0 (2026-05-14)
+
+知识库文件限制收紧 + 大文件独立队列 + 两阶段提交消除并发竞态。
+
+### 文件限制收紧
+- 新增 `config.py` — 运行时配置读取模块，`Limits` dataclass 统管所有限制值
+- 新默认值：文本 2MB / PDF 40 页 / Office 10MB / 图片 20MB / 音频 10 分钟 / 视频 5 分钟
+- `meta/config.yaml` 可覆盖默认值，缺失字段自动合并默认值
+- 提取层硬边界：PDF 截断前 N 页、Office/图片超限返回 `metadata_only`、文本流式读取截断
+- `SourceRegistry._determine_status()` 覆盖全部文件类型，音视频/未知类型统一返回 `metadata_only`
+
+### 大文件独立队列
+- 新增 `large_file_queue.py` — 目录式队列（pending/running/done/failed）+ 独立 worker 锁
+- 轻量预检：`_precheck_file()` 用 stat/mutagen/pdfplumber.open 判断是否超限，不执行完整提取
+- 超限文件自动分流到 `large_ingest_queue`，不阻塞普通文件摄入
+- `ingest-large` CLI 子命令：`enqueue` / `worker` / `status`
+- 入队时复制文件到 staging 目录，防止用户在 worker 处理期间移动/删除源文件
+
+### 两阶段提交（消除并发竞态）
+- 大文件 worker 重构为两阶段：阶段一在 `large_ingest.lock` 下做重提取（不写共享状态）；阶段二在 `ingest.lock` 下写共享状态
+- `large_ingest.lock` 覆盖整个任务生命周期，保证任意时刻最多一个大文件任务处于 running
+- 普通 ingest 仅在大文件提交阶段被短暂串行化，不被提取 IO 阻塞
+- `IngestPipeline.run()` 新增 `pre_extracted` 参数，支持跳过提取步骤直接使用已有结果
+
+### FTS 优化
+- `fts_pages` 虚拟表新增 `scope UNINDEXED` / `type UNINDEXED` / `updated_at UNINDEXED` 列
+- `search_pages()` 支持 scope 参数，过滤下推到 SQL 层
+- 查询引擎移除磁盘重读循环，委托 FTS 做 scope 过滤
+
+### 其他修复
+- OSS 未配置时 backup 消息从"跳过备份"改为诚实提示
+- `_acquire_lock` fd 泄漏修复（`os.open` → try/finally `os.close`）
+- YAML frontmatter 解析异常不跳过整文件，降级为无元数据
+- AST docstring 空首行处理
+
 ## v0.1.0 (2026-05-13)
 
 首次发布。MiniNote 已具备个人知识库的基本工作流：资料摄入、Wiki 生成、检索、检查、备份和恢复验证。
