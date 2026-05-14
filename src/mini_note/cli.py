@@ -8,6 +8,7 @@ import argparse
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 
 logger = logging.getLogger("mini_note")
@@ -378,14 +379,31 @@ def _cmd_precheck_disk(args: argparse.Namespace) -> dict:
             "safe_margin_bytes": 100 * 1024 * 1024,
             "would_fit": True,
             "message": "没有可评估的文件",
+            "time_estimation": {
+                "total_estimated_seconds": 0,
+                "estimated_human": "约 0 秒",
+                "by_category": {},
+            },
         }
 
-    return check_import_disk_space(ws, file_paths)
+    from mini_note.ingest.progress import estimate_batch_time, format_duration
+
+    disk_result = check_import_disk_space(ws, file_paths)
+    time_est = estimate_batch_time(file_paths)
+    disk_result["time_estimation"] = {
+        "total_estimated_seconds": time_est["total_estimated_seconds"],
+        "estimated_human": format_duration(time_est["total_estimated_seconds"]),
+        "by_category": time_est["by_category"],
+    }
+    return disk_result
 
 
 def _cmd_ingest_scan(args: argparse.Namespace) -> dict:
-    """扫描 inbox 目录批量摄入（含磁盘空间预检）。"""
+    """扫描 inbox 目录批量摄入（含磁盘空间预检、时间预估、进度追踪）。"""
     from mini_note.ingest.pipeline import IngestPipeline, check_import_disk_space
+    from mini_note.ingest.progress import (
+        BatchProgressTracker, estimate_batch_time, format_duration,
+    )
 
     ws: Path = args.workspace
     inbox_dir = ws / "raw" / "inbox"
@@ -420,14 +438,34 @@ def _cmd_ingest_scan(args: argparse.Namespace) -> dict:
                 retryable=False,
             )
 
+    # 初始化进度追踪器
+    tracker = BatchProgressTracker(pending_files)
+    init_est = tracker.initial_estimate
+
+    # 向 stderr 输出初始预估（OpenClaw 可解析反馈用户）
+    from datetime import datetime, timezone, timedelta
+    CST = timezone(timedelta(hours=8))
+    print(json.dumps({
+        "type": "estimation",
+        "ts": datetime.now(CST).isoformat(),
+        "total_files": len(pending_files),
+        "estimated_seconds": init_est["total_estimated_seconds"],
+        "estimated_human": format_duration(init_est["total_estimated_seconds"]),
+        "by_category": init_est["by_category"],
+    }, ensure_ascii=False), file=sys.stderr)
+    sys.stderr.flush()
+
     results = []
     pipeline = IngestPipeline(ws)
     for f in pending_files:
+        start = time.monotonic()
         r = pipeline.run(
             file_path=f,
             owner_id=args.owner,
             scope=args.scope,
         )
+        elapsed = time.monotonic() - start
+
         item = {
             "file": str(f.relative_to(ws)),
             "ok": r.ok,
@@ -440,7 +478,16 @@ def _cmd_ingest_scan(args: argparse.Namespace) -> dict:
             item["retryable"] = r.retryable
         results.append(item)
 
-    return {"ok": True, "results": results}
+        snapshot = tracker.file_complete(ok=r.ok, elapsed_seconds=elapsed)
+        if snapshot is not None:
+            print(json.dumps(snapshot, ensure_ascii=False), file=sys.stderr)
+            sys.stderr.flush()
+
+    return {
+        "ok": True,
+        "results": results,
+        "progress_summary": tracker.final_summary(),
+    }
 
 
 def _cmd_ingest_large(args: argparse.Namespace) -> dict:
