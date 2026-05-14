@@ -32,6 +32,7 @@
 | 默认协作模型 | 不要求具体团队定义；多人场景通过 `owner_id` 区分操作者，默认共享空间为 `shared` |
 | 文件上限 | 默认采用 `PDF <= 40 页`、`Office <= 10MB`、`文本 <= 2MB`、`图片 <= 20MB`、`音频 <= 10 分钟`、`视频 <= 5 分钟`，通过 `meta/config.yaml` 可配置 |
 | OpenClaw 接口形态 | 采用 Skill 编排 + 本地 CLI，OpenClaw 负责模型调用与决策，mini-note CLI 负责确定性状态变更与校验 |
+| Windows 支持 | 当前不承诺原生 Windows 支持；Windows 用户通过 WSL2 + Ubuntu 使用，具体安装和 Agent 调用方式见 `docs/windows-wsl.md` |
 
 ---
 
@@ -123,6 +124,32 @@ Workspace
 | Backup Engine | 生成 OSS 快照、记录校验值、执行恢复演练 |
 | Review Engine | 生成 OpenClaw 可处理的审核任务，执行白名单审核动作 |
 | Indexer | 从 Markdown、claim、manifest 重建 SQLite 派生索引 |
+
+### 5.2 Windows / WSL2 部署约束
+
+mini-note 当前运行时以 POSIX shell 环境为一等支持目标。Windows 上的推荐部署是 WSL2 + Ubuntu：
+
+```text
+Windows OpenClaw / WorkBuddy
+  |
+  |-- wsl -d Ubuntu -- bash -lc "cd ~/mini-note && ./run.sh ..."
+  v
+WSL2 Ubuntu
+  |
+  |-- ~/mini-note
+  |-- Python venv
+  |-- raw/ wiki/ meta/ .state/
+```
+
+关键约束：
+
+- `install.sh`、`run.sh`、`import.sh`、`verify.sh` 依赖 bash 和 POSIX 工具链。
+- `mini-note.skill.md` 的默认命令映射为 `./run.sh ...` 和 `./import.sh ...`。
+- 大量文件导入应在 WSL 文件系统内进行，避免在 `/mnt/c/...` 上承受较差的跨文件系统 IO 性能。
+- OpenClaw / WorkBuddy 安装 WSL2 前必须向用户确认管理员权限、重启、磁盘和内存成本。
+- 低配电脑可通过 Windows 用户目录下的 `.wslconfig` 限制 WSL2 资源，例如 `memory=4GB`、`processors=2`。
+
+原生 Windows 支持需要额外开发 PowerShell 脚本、跨平台 PID 检测和 Windows CI。未完成前，Windows 用户文档以 WSL2 路径为准。
 
 ---
 
@@ -758,7 +785,7 @@ python-pptx
 |---|---|---|
 | Python | >= 3.10 | `python3 -c "import sys; assert sys.version_info >= (3,10)"` |
 | pip | 任意 | 随 Python 附带，无需单独安装 |
-| 操作系统 | macOS / Linux | 不对 Windows 做原生兼容；Windows 用户建议 WSL |
+| 操作系统 | macOS / Linux | 不对 Windows 做原生兼容；Windows 用户建议 WSL2 + Ubuntu |
 
 **`install.sh` 脚本职责：**
 
@@ -807,7 +834,7 @@ oss2>=2.18
 - **不锁定 patch 版本**：`requirements.txt` 使用 `>=` 下限而不冻结 `==`，降低维护负担；CI 中可额外做 `pip freeze` 快照。
 - **zstd 降级策略**：`requirements.txt` 不强制依赖 zstd。CLI 在打包快照时自动检测 `zstd` 命令可用性，不可用则降级为 gzip。`restore verify` 解压时根据文件扩展名选择解码器。
 - **跨发行版兼容**：不假设 `python` == `python3`，统一使用 `python3`；不假设 `bash` 路径，使用 `#!/bin/bash`。
-- **Windows**：不原生支持。推荐 Windows 用户通过 WSL2 运行，安装流程与 Linux 一致。
+- **Windows**：不原生支持。推荐 Windows 用户通过 WSL2 + Ubuntu 运行；Agent 安装流程、资源成本和限制见 `docs/windows-wsl.md`。
 - **`config.example.yaml`**：提供完整配置键和默认值注释，用户复制后修改。`.env.example` 列出所有必需和可选环境变量，敏感字段留空。
 
 ### 16.3 更新维护
