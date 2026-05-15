@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.2.2 (2026-05-15)
+
+三轮 Code Review 修复 — relevance 语义修正、摄入失败分支闭环、claim/lint 质量提升。
+
+### 相关度归一化
+- FTS5 BM25 relevance 从 sigmoid `1/(1+|rank|)` 改为当次查询 min-max 批量归一化（修复 rank 负值与绝对值方向相反问题）
+- `_apply_bm25_relevance()`：`1.0 - (rank - best) / (worst - best)`，best=1.0，worst=0.0
+- 关键词回退使用 `score/(score+5)` 归一化
+- 查询结果同时返回 `rank`（原始）和 `relevance`（归一化 [0,1]）
+
+### 摄入失败分支闭环
+- 索引重建失败返回 `ok: false` + `INDEX_REBUILD_FAILED`，不执行 cleanup
+- 健康检查失败返回 `ok: false` + `HEALTH_CHECK_FAILED`，不执行 cleanup
+- 两失败返回均显式包含 `cleaned_count: 0`
+- 批次 finalization 阶段以 `_acquire_lock`/`_release_lock` 保护（rebuild + health + cleanup）
+
+### cleanup 语义修正
+- 仅移动 `r.ok` 且 `dedup_status != "queued_large_file"` 的成功文件
+- inbox 扫描排除条件收窄为 `rel_parts[0] == "processed"`，仅跳过根 `raw/inbox/processed/`
+- symlink 等失败文件保留在 inbox，不被 cleanup 误移
+
+### dedup 统计修正
+- `dedup_summary` 新增 `failed` 计数键
+- `r.ok` 才按 `dedup_status` 归类（new/existing/queued_large_file），`not r.ok` 归入 `failed`
+
+### claim 提取增强
+- 三层启发式策略：数字事实句（≥15字）→ bullet/编号列表项（8-300字）→ 会议关键词句（≥15字）
+- 同源文本去重（`seen_texts` 集合）
+- `quote_hash` 写入 `sha256:` + hexdigest；`verified_at` 初始化为空字符串
+
+### lint 分级降噪
+- 5 项检查统一返回 `severity`/`category`/`confidence`
+- contradictions 从 error 降为 warning（confidence 0.5，启发式推断）
+- broken_wikilinks / claim_grounding / partial_misuse：warning，confidence 1.0
+- orphan_pages：info，confidence 1.0
+- 新增 `--min-severity` 过滤（error/warning/info），默认 warning
+- 返回 `lint_summary`（total_before_filter / total_after_filter / suppressed_count）
+
+### 进度追踪优化
+- 时间间隔 60s → 30s
+- 里程碑扩展至 10%/25%/50%/75%/90%（原 25%/75%）
+- EMA 自适应 alpha 衰减：`max(0.1, min(0.5, 3.0/(processed+3)))`
+
+### 文档与脚本
+- `import.sh` fmt_bytes 使用 `$VENV_PYTHON` 替代裸 `python3`
+- `mini-note.skill.md` 错误处理表补 `INDEX_REBUILD_FAILED` / `HEALTH_CHECK_FAILED`
+- `README.md` 同步 `--cleanup`、`--min-severity`、relevance 字段说明
+
+### 测试
+- 新增 `tests/unit/test_pipeline.py`（6 个 claim 构建用例 + 2 个 lint summary 用例）
+- 新增 `tests/unit/test_cli.py::TestScanInboxFailureBranches`（4 个失败分支用例）
+- `tests/unit/test_query_engine.py` 补 `TestRelevanceNormalization`（4 个用例）
+- 全量：358 passed, 10 skipped
+
 ## v0.2.1 (2026-05-14)
 
 批量导入磁盘空间预检 + PID 锁文件过期自动清理。
