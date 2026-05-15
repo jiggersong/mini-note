@@ -75,11 +75,12 @@ class QueryEngine:
                 "title": item.get("title", ""),
                 "type": item.get("type", ""),
                 "scope": item.get("scope", "shared"),
-                "relevance": round(item.get("rank", 0), 4),
+                "rank": item.get("rank", 0),
                 "snippet": item.get("snippet", ""),
                 "updated_at": item.get("updated_at", ""),
             })
 
+        _apply_bm25_relevance(results)
         return results
 
     def _search_claims_fts(self, question: str) -> list[dict] | None:
@@ -97,10 +98,10 @@ class QueryEngine:
         # 补充完整 claim 数据
         results = []
         for item in raw:
-            # 从文件读取完整数据
+            rank = item.get("rank", 0)
             full = self._lookup_claim(item.get("claim_id", ""))
             if full:
-                full["relevance"] = round(item.get("rank", 0), 4)
+                full["rank"] = rank
                 full["snippet"] = item.get("snippet", "")
                 results.append(full)
             else:
@@ -112,9 +113,11 @@ class QueryEngine:
                     "quote_hash": "",
                     "status": "active",
                     "verified_at": "",
-                    "relevance": round(item.get("rank", 0), 4),
+                    "rank": rank,
                     "snippet": item.get("snippet", ""),
                 })
+
+        _apply_bm25_relevance(results)
 
         return results
 
@@ -169,15 +172,16 @@ class QueryEngine:
                 title = fm.get("title", md_file.stem)
                 body = text.split("---\n", 2)[-1] if text.startswith("---") else text
 
-                relevance = self._score(body, keywords)
-                if relevance > 0:
+                score = self._score(body, keywords)
+                if score > 0:
                     results.append({
                         "page_id": fm.get("page_id", rel_path),
                         "path": rel_path,
                         "title": title,
                         "type": fm.get("type", ""),
                         "scope": page_scope,
-                        "relevance": relevance,
+                        "rank": score,
+                        "relevance": _normalize_keyword_score(score),
                         "snippet": body[:300].strip(),
                         "updated_at": fm.get("updated_at", ""),
                     })
@@ -203,8 +207,8 @@ class QueryEngine:
                     continue
                 for c in data["claims"]:
                     text = c.get("text", "")
-                    relevance = self._score(text, keywords)
-                    if relevance > 0:
+                    score = self._score(text, keywords)
+                    if score > 0:
                         results.append({
                             "claim_id": c.get("claim_id"),
                             "source_id": c.get("source_id"),
@@ -213,7 +217,8 @@ class QueryEngine:
                             "quote_hash": c.get("quote_hash", ""),
                             "status": c.get("status", "active"),
                             "verified_at": c.get("verified_at", ""),
-                            "relevance": relevance,
+                            "rank": score,
+                            "relevance": _normalize_keyword_score(score),
                         })
             except Exception:
                 continue
@@ -262,3 +267,26 @@ class QueryEngine:
             return yaml.safe_load(text[3:end]) or {}
         except Exception:
             return {}
+
+
+def _apply_bm25_relevance(results: list[dict]) -> None:
+    """对当次查询结果做 min-max 归一化，BM25 rank 越小（越负）越相关。
+
+    最佳条目 relevance=1.0，最差条目 relevance=0.0。
+    单结果或所有 rank 相同时全部设为 1.0。
+    """
+    if not results:
+        return
+    ranks = [r["rank"] for r in results]
+    best = min(ranks)
+    worst = max(ranks)
+    for r in results:
+        if best == worst:
+            r["relevance"] = 1.0
+        else:
+            r["relevance"] = round(1.0 - (r["rank"] - best) / (worst - best), 4)
+
+
+def _normalize_keyword_score(score: int) -> float:
+    """将关键词命中次数归一化到 [0, 1]，5 次命中 ≈ 0.5。"""
+    return round(score / (score + 5), 4)

@@ -256,8 +256,8 @@ class TestBatchProgressTracker:
                 p.unlink(missing_ok=True)
 
     def test_no_snapshot_within_short_interval(self):
-        """短时间内连续处理不触发快照（非首文件、非里程碑、未到 60 秒）。"""
-        files = _make_temp_files(".txt", 20)
+        """短时间内连续处理不触发快照（非首文件、非里程碑、未到 30 秒）。"""
+        files = _make_temp_files(".txt", 30)
         try:
             tracker = BatchProgressTracker(files)
 
@@ -265,13 +265,9 @@ class TestBatchProgressTracker:
             snap1 = tracker.file_complete(ok=True, elapsed_seconds=0.3)
             assert snap1 is not None
 
-            # 第 2-4 个文件不触发（未到 25% 里程碑 point=5, 也未到 60s）
+            # 第 2 个文件不触发（2/30≈6.7%, 未到 10% 里程碑 point=3, 也未到 30s）
             snap2 = tracker.file_complete(ok=True, elapsed_seconds=0.3)
             assert snap2 is None
-            snap3 = tracker.file_complete(ok=True, elapsed_seconds=0.3)
-            assert snap3 is None
-            snap4 = tracker.file_complete(ok=True, elapsed_seconds=0.3)
-            assert snap4 is None
         finally:
             for p in files:
                 p.unlink(missing_ok=True)

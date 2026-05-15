@@ -249,3 +249,175 @@ class TestCLIErrorFormat:
             "health", "--workspace", str(tmp_workspace), "--json",
         ])
         assert isinstance(result, dict)
+
+
+class TestScanInboxCleanup:
+    """inbox 扫描排除 processed/ 与 cleanup 只移动成功文件。"""
+
+    def test_scan_excludes_processed_dir(self, tmp_workspace):
+        """raw/inbox/processed/ 下的文件不被扫描。"""
+        from mini_note.cli import main
+
+        main(["init", "--workspace", str(tmp_workspace)])
+        inbox = tmp_workspace / "raw" / "inbox" / "users"
+        inbox.mkdir(parents=True, exist_ok=True)
+        processed = tmp_workspace / "raw" / "inbox" / "processed" / "20260514"
+        processed.mkdir(parents=True, exist_ok=True)
+
+        # 在 processed/ 写入文件
+        old_file = processed / "old.md"
+        old_file.write_text("# old")
+        # 在 users/ 写入待处理文件
+        new_file = inbox / "new.md"
+        new_file.write_text("# new")
+
+        result = main([
+            "ingest", "--workspace", str(tmp_workspace),
+            "--scan-inbox", "--json",
+        ])
+        assert result["ok"] is True
+        # processed/ 下文件不应被扫描
+        files = [r["file"] for r in result.get("results", [])]
+        assert "raw/inbox/processed/20260514/old.md" not in files
+        assert any("new.md" in f for f in files)
+
+    def test_cleanup_keeps_failed_file_in_inbox(self, tmp_workspace):
+        """失败文件不被 cleanup 移走。symlink 会被拒绝。"""
+        from mini_note.cli import main
+        import os
+
+        main(["init", "--workspace", str(tmp_workspace)])
+        inbox = tmp_workspace / "raw" / "inbox" / "users"
+        inbox.mkdir(parents=True, exist_ok=True)
+
+        # 正常文件
+        good = inbox / "good.md"
+        good.write_text("# good file")
+        # 符号链接会被拒绝
+        bad_link = inbox / "bad_link.md"
+        target = tmp_workspace / "target.md"
+        target.write_text("target")
+        os.symlink(str(target), str(bad_link))
+
+        result = main([
+            "ingest", "--workspace", str(tmp_workspace),
+            "--scan-inbox", "--cleanup", "processed", "--json",
+        ])
+        # good.md 应被移走，symlink 应留在 inbox
+        assert not good.exists(), "成功文件应被 cleanup 移走"
+        assert bad_link.exists(), "失败文件(symlink)应留在 inbox"
+
+    def test_empty_inbox_returns_early(self, tmp_workspace):
+        """空 inbox 目录直接返回。"""
+        from mini_note.cli import main
+
+        main(["init", "--workspace", str(tmp_workspace)])
+        result = main([
+            "ingest", "--workspace", str(tmp_workspace),
+            "--scan-inbox", "--json",
+        ])
+        assert result["ok"] is True
+        assert result.get("message") == "inbox 中没有待处理文件"
+
+
+class TestScanInboxFailureBranches:
+    """批量摄入失败分支：health/index 失败不 cleanup，dedup 失败计数。"""
+
+    def test_health_failure_returns_error_and_keeps_files(self, tmp_workspace, monkeypatch):
+        """health check 失败时返回 HEALTH_CHECK_FAILED，不执行 cleanup。"""
+        from mini_note.cli import main
+
+        main(["init", "--workspace", str(tmp_workspace)])
+        inbox = tmp_workspace / "raw" / "inbox" / "users"
+        inbox.mkdir(parents=True, exist_ok=True)
+        test_file = inbox / "note.md"
+        test_file.write_text("# test health failure")
+
+        import mini_note.lint.health as health_module
+        monkeypatch.setattr(
+            health_module, "run_health_check",
+            lambda ws: {"ok": False, "checks": [{"name": "db", "passed": False}]},
+        )
+
+        result = main([
+            "ingest", "--workspace", str(tmp_workspace),
+            "--scan-inbox", "--cleanup", "processed", "--json",
+        ])
+        assert result["ok"] is False
+        assert result["error_code"] == "HEALTH_CHECK_FAILED"
+        assert result["cleaned_count"] == 0
+        assert test_file.exists(), "health 失败时文件应保留在 inbox"
+
+    def test_only_excludes_root_processed_dir(self, tmp_workspace):
+        """仅排除 raw/inbox/processed/，用户子目录中名为 processed 的仍扫描。"""
+        from mini_note.cli import main
+
+        main(["init", "--workspace", str(tmp_workspace)])
+        # 根 processed/ 文件
+        root_processed = tmp_workspace / "raw" / "inbox" / "processed" / "20260515"
+        root_processed.mkdir(parents=True, exist_ok=True)
+        (root_processed / "skip.md").write_text("# skip")
+        # 用户子目录中名为 processed/ 的文件
+        user_processed = tmp_workspace / "raw" / "inbox" / "users" / "project" / "processed"
+        user_processed.mkdir(parents=True, exist_ok=True)
+        (user_processed / "note.md").write_text("# include")
+
+        result = main([
+            "ingest", "--workspace", str(tmp_workspace),
+            "--scan-inbox", "--json",
+        ])
+        files = [r["file"] for r in result.get("results", [])]
+        assert not any("raw/inbox/processed/" in f for f in files), \
+            "根 processed/ 不应被扫描"
+        assert any("users/project/processed/note.md" in f for f in files), \
+            "用户子目录 processed/ 应被扫描"
+
+    def test_failed_file_in_dedup_summary_failed(self, tmp_workspace):
+        """symlink 失败文件计入 dedup_summary.failed，不计入 new。"""
+        from mini_note.cli import main
+        import os
+
+        main(["init", "--workspace", str(tmp_workspace)])
+        inbox = tmp_workspace / "raw" / "inbox" / "users"
+        inbox.mkdir(parents=True, exist_ok=True)
+        # 正常文件
+        (inbox / "good.md").write_text("# good")
+        # symlink 失败
+        target = tmp_workspace / "target.md"
+        target.write_text("target")
+        os.symlink(str(target), str(inbox / "bad.md"))
+
+        result = main([
+            "ingest", "--workspace", str(tmp_workspace),
+            "--scan-inbox", "--json",
+        ])
+        ds = result.get("dedup_summary", {})
+        assert ds.get("failed", 0) >= 1, f"symlink 失败应计入 failed，实际: {ds}"
+
+    def test_index_rebuild_failure_returns_error_and_keeps_files(self, tmp_workspace, monkeypatch):
+        """索引重建失败时返回 INDEX_REBUILD_FAILED，不执行 cleanup。"""
+        from mini_note.cli import main
+
+        main(["init", "--workspace", str(tmp_workspace)])
+        inbox = tmp_workspace / "raw" / "inbox" / "users"
+        inbox.mkdir(parents=True, exist_ok=True)
+        test_file = inbox / "note.md"
+        test_file.write_text("# test index failure")
+
+        class FakeIndexer:
+            def __init__(self, *args, **kwargs):
+                pass
+            def rebuild(self):
+                raise RuntimeError("simulated index crash")
+
+        import mini_note.indexer as idx_mod
+        monkeypatch.setattr(idx_mod, "Indexer", FakeIndexer)
+
+        result = main([
+            "ingest", "--workspace", str(tmp_workspace),
+            "--scan-inbox", "--cleanup", "processed", "--json",
+        ])
+        assert result["ok"] is False
+        assert result["error_code"] == "INDEX_REBUILD_FAILED"
+        assert result.get("cleaned_count") == 0
+        assert test_file.exists(), "索引失败时文件应保留在 inbox"

@@ -1,7 +1,7 @@
 """批量导入时间预估与进度追踪。
 
 提供预检阶段的时间预估（按文件类型和大小），以及导入过程中的
-自适应 EMA 进度追踪，每 60 秒或里程碑节点向 stderr 输出 JSON Lines 快照。
+自适应 EMA 进度追踪，每 30 秒或里程碑节点向 stderr 输出 JSON Lines 快照。
 """
 
 import time as _time
@@ -161,8 +161,8 @@ class BatchProgressTracker:
 
     每处理完一个文件调用 file_complete()，当满足以下条件时返回进度快照：
     - 首个文件完成
-    - 距上次报告已过 60 秒
-    - 达到 25% 或 75% 里程碑
+    - 距上次报告已过 30 秒
+    - 达到 10%、25%、50%、75% 或 90% 里程碑
     - 全部文件处理完毕
     """
 
@@ -198,18 +198,16 @@ class BatchProgressTracker:
         # 判断是否需要输出快照
         is_first = self.processed == 1
         is_done = self.processed >= self.total
-        is_time = since_report >= 60.0
+        is_time = since_report >= 30.0
         pct = self.processed / max(self.total, 1)
-        is_quarter = pct >= 0.25 and 25 not in self._milestones_triggered
-        is_three_quarters = pct >= 0.75 and 75 not in self._milestones_triggered
-
-        if not (is_first or is_done or is_time or is_quarter or is_three_quarters):
-            return None
-
-        # 记录已触发的里程碑
-        for m in (25, 75):
-            if pct * 100 >= m:
+        at_milestone = False
+        for m in (10, 25, 50, 75, 90):
+            if pct * 100 >= m and m not in self._milestones_triggered:
+                at_milestone = True
                 self._milestones_triggered.add(m)
+
+        if not (is_first or is_done or is_time or at_milestone):
+            return None
 
         self._last_report_time = now
 

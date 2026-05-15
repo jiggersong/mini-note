@@ -19,6 +19,7 @@ usage() {
     echo "  --owner ID      文件归属（默认 user-default）"
     echo "  --scope SCOPE   可见范围 shared/private（默认 shared）"
     echo "  --force         跳过磁盘空间预检，强制导入"
+    echo "  --cleanup       导入后将 inbox 文件移至 processed/"
     echo "  --dry-run       仅列出文件，不执行导入"
     echo "  --help          显示帮助"
     echo ""
@@ -32,9 +33,20 @@ usage() {
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# 固定 venv Python 路径（不依赖 PATH 中的 python3）
+VENV_PYTHON="$SCRIPT_DIR/venv/bin/python3"
+if [ ! -x "$VENV_PYTHON" ]; then
+    echo -e "${RED}错误: 未找到 venv Python ($VENV_PYTHON)，请先运行 ./install.sh${NC}" >&2
+    exit 1
+fi
+
+export PYTHONUNBUFFERED=1
+export PYTHONIOENCODING=UTF-8
+
 # 参数解析
 DRY_RUN=false
 FORCE=false
+CLEANUP=""
 OWNER="user-default"
 SCOPE="shared"
 SRC_DIR=""
@@ -44,6 +56,7 @@ while [[ $# -gt 0 ]]; do
         --help|-h) usage ;;
         --dry-run) DRY_RUN=true; shift ;;
         --force) FORCE=true; shift ;;
+        --cleanup) CLEANUP="--cleanup processed"; shift ;;
         --owner) OWNER="$2"; shift 2 ;;
         --scope) SCOPE="$2"; shift 2 ;;
         -*) echo -e "${RED}未知选项: $1${NC}"; exit 1 ;;
@@ -115,7 +128,7 @@ if [ "$FORCE" = false ]; then
         exit 1
     fi
     # 提取评估数据；import.sh 估算 = 原始文件 × 3（含 inbox 副本）
-    ASSESSMENT=$(echo "$PRECHECK" | python3 -c "
+    ASSESSMENT=$(echo "$PRECHECK" | "$VENV_PYTHON" -c "
 import sys, json
 d = json.load(sys.stdin)
 total = d.get('total_size_bytes', 0)
@@ -134,7 +147,7 @@ print(f'{d.get(\"file_count\",0)}|{total}|{avail}|{est}|{fit}')
     IFS='|' read -r FC TOTAL_SZ AVAIL_SZ EST_SZ WOULD_FIT <<< "$ASSESSMENT"
 
     fmt_bytes() {
-        python3 -c "print(f'{$1 / 1024 / 1024:.1f} MB')"
+        "$VENV_PYTHON" -c "print(f'{$1 / 1024 / 1024:.1f} MB')"
     }
     echo "  文件数: $FC"
     echo "  文件总大小: $(fmt_bytes $TOTAL_SZ)"
@@ -179,19 +192,17 @@ echo "已复制 $COPIED 个文件。"
 # 执行批量摄入
 echo ""
 echo "--- 执行批量摄入 ---"
-if [ -f venv/bin/activate ]; then
-    source venv/bin/activate
-fi
 FORCE_FLAG=""
 if [ "$FORCE" = true ]; then
     FORCE_FLAG="--force"
 fi
-PYTHONPATH="$SCRIPT_DIR/src" python3 -m mini_note.cli ingest \
+PYTHONPATH="$SCRIPT_DIR/src" "$VENV_PYTHON" -u -m mini_note.cli ingest \
     --workspace "$SCRIPT_DIR" \
     --scan-inbox \
     --owner "$OWNER" \
     --scope "$SCOPE" \
     $FORCE_FLAG \
+    $CLEANUP \
     --json
 
 echo ""

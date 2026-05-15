@@ -32,6 +32,12 @@ def _error_result(
 
 def main(argv: list[str] | None = None) -> dict | list:
     """CLI 主入口。"""
+    # 强制 UTF-8 输出（解决 LANG=C 等非 UTF-8 环境下的中文乱码）
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+
     if argv is None:
         argv = sys.argv[1:]
 
@@ -57,6 +63,8 @@ def main(argv: list[str] | None = None) -> dict | list:
     lint_p.add_argument("--json", action="store_true", default=False)
     lint_p.add_argument("--changed-only", action="store_true", default=False)
     lint_p.add_argument("--full", action="store_true", default=False)
+    lint_p.add_argument("--min-severity", type=str, default="warning",
+                        choices=["error", "warning", "info"])
 
     # ingest
     ingest_p = subparsers.add_parser("ingest", help="摄入文件")
@@ -66,6 +74,7 @@ def main(argv: list[str] | None = None) -> dict | list:
     ingest_p.add_argument("--scope", type=str, default="shared")
     ingest_p.add_argument("--scan-inbox", action="store_true", default=False)
     ingest_p.add_argument("--force", action="store_true", default=False)
+    ingest_p.add_argument("--cleanup", type=str, default=None, choices=["processed"])
     ingest_p.add_argument("--json", action="store_true", default=False)
     ingest_sp = ingest_p.add_subparsers(dest="ingest_command")
     precheck_p = ingest_sp.add_parser("precheck-disk", help="评估导入文件的磁盘空间需求")
@@ -283,14 +292,38 @@ def _cmd_health(args: argparse.Namespace) -> dict:
 
 def _cmd_lint(args: argparse.Namespace) -> dict:
     from mini_note.lint.engine import LintEngine
+
+    SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
+    min_severity = getattr(args, "min_severity", "warning")
+    min_rank = SEVERITY_RANK.get(min_severity, 1)
+
+    total_before = 0
+    total_after = 0
+
+    def _filter(items: list[dict]) -> list[dict]:
+        nonlocal total_before, total_after
+        total_before += len(items)
+        if not items:
+            return items
+        filtered = [it for it in items
+                    if SEVERITY_RANK.get(it.get("severity", "info"), 2) <= min_rank]
+        total_after += len(filtered)
+        return filtered
+
     engine = LintEngine(args.workspace)
     return {
         "ok": True,
-        "broken_wikilinks": engine.check_broken_wikilinks(),
-        "orphan_pages": engine.check_orphan_pages(),
-        "claim_grounding": engine.check_claim_grounding(),
-        "contradictions": engine.check_contradictions(),
-        "partial_misuse": engine.check_partial_misuse(),
+        "broken_wikilinks": _filter(engine.check_broken_wikilinks()),
+        "orphan_pages": _filter(engine.check_orphan_pages()),
+        "claim_grounding": _filter(engine.check_claim_grounding()),
+        "contradictions": _filter(engine.check_contradictions()),
+        "partial_misuse": _filter(engine.check_partial_misuse()),
+        "lint_summary": {
+            "min_severity": min_severity,
+            "total_before_filter": total_before,
+            "total_after_filter": total_after,
+            "suppressed_count": total_before - total_after,
+        },
     }
 
 
@@ -323,6 +356,7 @@ def _cmd_ingest(args: argparse.Namespace) -> dict:
         "ingestion_status": result.ingestion_status,
         "backup_status": result.backup_status,
         "source_page_path": result.source_page_path,
+        "dedup_status": result.dedup_status,
     }
     if not result.ok:
         out["error_code"] = result.error_code
@@ -400,7 +434,11 @@ def _cmd_precheck_disk(args: argparse.Namespace) -> dict:
 
 def _cmd_ingest_scan(args: argparse.Namespace) -> dict:
     """扫描 inbox 目录批量摄入（含磁盘空间预检、时间预估、进度追踪）。"""
-    from mini_note.ingest.pipeline import IngestPipeline, check_import_disk_space
+    import shutil
+    from mini_note.ingest.pipeline import (
+        IngestPipeline, check_import_disk_space,
+        _acquire_lock, _release_lock,
+    )
     from mini_note.ingest.progress import (
         BatchProgressTracker, estimate_batch_time, format_duration,
     )
@@ -410,12 +448,16 @@ def _cmd_ingest_scan(args: argparse.Namespace) -> dict:
     if not inbox_dir.exists():
         return {"ok": True, "results": [], "message": "inbox 目录不存在"}
 
-    # 收集待处理文件
+    # 收集待处理文件（排除 processed/ 已处理目录）
     pending_files = []
     for f in sorted(inbox_dir.rglob("*")):
         if not f.is_file():
             continue
         if f.name.startswith(".") or f.name.endswith(".gitkeep"):
+            continue
+        # 排除 raw/inbox/processed/ 根下的历史文件
+        rel_parts = f.relative_to(inbox_dir).parts
+        if rel_parts and rel_parts[0] == "processed":
             continue
         pending_files.append(f)
 
@@ -456,6 +498,7 @@ def _cmd_ingest_scan(args: argparse.Namespace) -> dict:
     sys.stderr.flush()
 
     results = []
+    dedup_stats = {"new": 0, "existing": 0, "queued_large_file": 0, "failed": 0}
     pipeline = IngestPipeline(ws)
     for f in pending_files:
         start = time.monotonic()
@@ -463,6 +506,8 @@ def _cmd_ingest_scan(args: argparse.Namespace) -> dict:
             file_path=f,
             owner_id=args.owner,
             scope=args.scope,
+            rebuild_index=False,       # 批次末尾统一重建
+            run_health_check=False,    # 批次末尾统一检查
         )
         elapsed = time.monotonic() - start
 
@@ -471,23 +516,111 @@ def _cmd_ingest_scan(args: argparse.Namespace) -> dict:
             "ok": r.ok,
             "source_id": r.source_id,
             "ingestion_status": r.ingestion_status,
+            "dedup_status": r.dedup_status,
         }
         if not r.ok:
             item["error_code"] = r.error_code
             item["message"] = r.message
             item["retryable"] = r.retryable
         results.append(item)
+        if r.ok:
+            dedup_stats[r.dedup_status] = dedup_stats.get(r.dedup_status, 0) + 1
+        else:
+            dedup_stats["failed"] += 1
 
         snapshot = tracker.file_complete(ok=r.ok, elapsed_seconds=elapsed)
         if snapshot is not None:
             print(json.dumps(snapshot, ensure_ascii=False), file=sys.stderr)
             sys.stderr.flush()
 
-    return {
-        "ok": True,
-        "results": results,
-        "progress_summary": tracker.final_summary(),
-    }
+    # 批次末尾：统一重建索引 + 健康检查（持有批次锁防止并发写）
+    _acquire_lock(ws)
+    try:
+        indexed = False
+        sqlite_counts = {}
+        index_error = None
+        try:
+            from mini_note.indexer import Indexer
+            Indexer(ws).rebuild()
+            indexed = True
+            db_path = ws / ".state" / "notes.db"
+            if db_path.exists():
+                import sqlite3
+                conn = sqlite3.connect(str(db_path))
+                try:
+                    for table in ("sources", "pages", "claims"):
+                        row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                        sqlite_counts[table] = row[0] if row else 0
+                finally:
+                    conn.close()
+        except Exception as e:
+            logger.error(f"索引重建失败: {e}", exc_info=True)
+            index_error = str(e)
+
+        if index_error is not None:
+            return {
+                "ok": False,
+                "error_code": "INDEX_REBUILD_FAILED",
+                "message": f"索引重建失败: {index_error}",
+                "retryable": True,
+                "results": results,
+                "indexed": False,
+                "cleaned_count": 0,
+                "sqlite_counts": sqlite_counts,
+                "dedup_summary": dedup_stats,
+                "progress_summary": tracker.final_summary(),
+            }
+
+        from mini_note.lint.health import run_health_check
+        health = run_health_check(ws)
+        health_ok = health.get("ok", False)
+        if not health_ok:
+            return {
+                "ok": False,
+                "error_code": "HEALTH_CHECK_FAILED",
+                "message": "批量摄入后健康检查失败",
+                "retryable": True,
+                "results": results,
+                "indexed": indexed,
+                "cleaned_count": 0,
+                "health": health,
+                "sqlite_counts": sqlite_counts,
+                "dedup_summary": dedup_stats,
+                "progress_summary": tracker.final_summary(),
+            }
+
+        # 清理已处理的 inbox 文件（仅移动成功摄入的文件）
+        cleaned_count = 0
+        if getattr(args, "cleanup", None) == "processed":
+            success_paths = set()
+            for r, f in zip(results, pending_files):
+                if r["ok"] and r.get("dedup_status") != "queued_large_file":
+                    success_paths.add(f)
+            today = datetime.now(CST).strftime("%Y%m%d")
+            processed_dir = inbox_dir / "processed" / today
+            processed_dir.mkdir(parents=True, exist_ok=True)
+            for f in pending_files:
+                if f not in success_paths or not f.exists():
+                    continue
+                dest = processed_dir / f.name
+                if dest.exists():
+                    ts = datetime.now(CST).strftime("%H%M%S")
+                    dest = processed_dir / f"{f.stem}-{ts}{f.suffix}"
+                shutil.move(str(f), str(dest))
+                cleaned_count += 1
+
+        return {
+            "ok": True,
+            "results": results,
+            "indexed": indexed,
+            "health_ok": health_ok,
+            "sqlite_counts": sqlite_counts,
+            "dedup_summary": dedup_stats,
+            "cleaned_count": cleaned_count,
+            "progress_summary": tracker.final_summary(),
+        }
+    finally:
+        _release_lock(ws)
 
 
 def _cmd_ingest_large(args: argparse.Namespace) -> dict:

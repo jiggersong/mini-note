@@ -36,4 +36,12 @@ meta/identities.yaml
 # 审查报告（内部临时，不入库）
 docs/code_review_report.md
 docs/gemini_system_limits_review.md
+docs/codex_kb_limits_review.md
 docs/kb-limits-ingest-review-CURSOR.md
+
+# AI 审查与优化方案文档（内部参考，不入库）
+docs/Codex-*.md
+docs/Cursor-*.md
+docs/Gemini_*.md
+docs/Claude-*.md
+docs/mini-note-usage-report-*.md

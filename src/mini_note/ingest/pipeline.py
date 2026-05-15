@@ -31,6 +31,7 @@ class IngestResult:
     message: str | None = None
     retryable: bool = False
     source_page_path: str | None = None
+    dedup_status: str = "new"  # "new" | "existing" | "queued_large_file"
 
 
 class IngestPipeline:
@@ -51,12 +52,16 @@ class IngestPipeline:
         skip_precheck: bool = False,
         use_lock: bool = True,
         pre_extracted: ExtractionResult | None = None,
+        rebuild_index: bool = True,
+        run_health_check: bool = True,
     ) -> IngestResult:
         """执行摄入流程（不含 LLM 分析步骤）。
 
         skip_precheck=True 时跳过预检分流（大文件 worker 使用）。
         use_lock=False 时不获取 ingest.lock（调用方自行管理锁）。
         pre_extracted 为 ExtractionResult 时跳过提取步骤，直接使用已有结果。
+        rebuild_index=False 时跳过单文件索引重建（批量模式在批次末尾统一重建）。
+        run_health_check=False 时跳过单文件健康检查（批量模式在批次末尾统一检查）。
         """
         operation_id = _gen_operation_id()
         op = None
@@ -98,6 +103,7 @@ class IngestPipeline:
                         operation_id=large_op_id,
                         ingestion_status="queued_large_file",
                         backup_status="none",
+                        dedup_status="queued_large_file",
                         message=f"大文件已进入后台队列（{precheck['limit_type']}: {precheck['actual_value']}）",
                     )
 
@@ -114,6 +120,7 @@ class IngestPipeline:
                     source_id=existing_id,
                     ingestion_status="full",
                     backup_status="none",
+                    dedup_status="existing",
                     message="文件已存在，跳过重复摄入",
                 )
 
@@ -170,15 +177,17 @@ class IngestPipeline:
             )
             _update_index(self.workspace, source_page_rel)
 
-            # 9. Rebuild derived index
-            idx = Indexer(self.workspace)
-            idx.rebuild()
+            # 9. Rebuild derived index（批量模式可由调用方在批次末尾统一执行）
+            if rebuild_index:
+                idx = Indexer(self.workspace)
+                idx.rebuild()
 
-            # 10. Health check
-            from mini_note.lint.health import run_health_check
-            health = run_health_check(self.workspace)
-            if not health["ok"]:
-                raise RuntimeError("Health check 失败: " + str(health["checks"]))
+            # 10. Health check（批量模式可由调用方在批次末尾统一执行）
+            if run_health_check:
+                from mini_note.lint.health import run_health_check
+                health = run_health_check(self.workspace)
+                if not health["ok"]:
+                    raise RuntimeError("Health check 失败: " + str(health["checks"]))
 
             # 11. Emit review tasks (MVP: 简化)
             # 如有冲突 claim 则生成 review task
@@ -470,37 +479,80 @@ def check_import_disk_space(workspace: Path, file_paths: list[Path]) -> dict:
 
 
 def _build_claims(source_id: str, content: str, ext: str) -> list[dict]:
-    """从解析内容中提取基础 claim（启发式占位，待 Skill 补全）。
+    """从解析内容中提取基础 claim（启发式，待 Skill 补全）。
 
-    MVP 阶段：提取包含数字的句子作为候选 claim，quote_hash 为空。
-    完整 claim 提取（含原文 hash、精确定位）由 LLM (Skill 侧) 完成。
+    三层提取策略：
+    1. 含数字的句子（≥15 字）— 数值事实
+    2. 列表/要点行（以 - * • 或数字序号开头，8-300 字）— 结构化知识
+    3. 会议/讨论关键句（含会议关键词，15-300 字）— 会议纪要
     """
+    import hashlib
     import re
 
     claims = []
-    # 简单的句子分割
-    sentences = re.split(r"[。\n](?=\s*[A-Z一-鿿])", content)
+    seen_texts: set[str] = set()
     idx = 0
 
-    for sent in sentences:
-        sent = sent.strip()
-        if len(sent) < 10 or len(sent) > 300:
+    def _add_claim(text: str, method: str, locator: str) -> int:
+        nonlocal idx
+        key = text[:80].strip()
+        if key in seen_texts:
+            return 0
+        seen_texts.add(key)
+        idx += 1
+        claim_id = f"claim-{datetime.now(CST).strftime('%Y%m%d')}-{datetime.now(CST).strftime('%H%M%S')}-{idx:04d}"
+        claims.append({
+            "claim_id": claim_id,
+            "source_id": source_id,
+            "text": text[:200],
+            "locator": locator,
+            "quote_hash": "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "extraction_method": method,
+            "confidence": 0.6,
+            "status": "unverified",
+            "verified_at": "",
+        })
+        return 1
+
+    bullet_re = re.compile(r"^[\s]*([-*•]|\d+[.)])\s+(.+)$", re.MULTILINE)
+    meeting_kw = re.compile(
+        r"(会议|讨论|决定|结论|行动项|TODO|纪要|议题|决议|下一步|跟进|待办|共识|备忘|记录|出席|汇报|总结|安排|计划)"
+    )
+    digit_re = re.compile(r"\d+")
+
+    lines = content.split("\n")
+    para_idx = 0
+
+    # Pass 1: bullet/list items
+    for i, line in enumerate(lines):
+        m = bullet_re.match(line)
+        if not m:
             continue
-        # 只提取包含数字或关键模式的句子
-        if re.search(r"\d+", sent) and len(sent) > 15:
-            idx += 1
-            claim_id = f"claim-{datetime.now(CST).strftime('%Y%m%d')}-{datetime.now(CST).strftime('%H%M%S')}-{idx:04d}"
-            claims.append({
-                "claim_id": claim_id,
-                "source_id": source_id,
-                "text": sent[:200],
-                "locator": f"content paragraph={idx}",
-                "quote_hash": "",  # 启发式占位，待 Skill 计算原文 SHA256
-                "extraction_method": "heuristic" if ext in (".md", ".txt") else "extractor",
-                "confidence": 0.6,
-                "status": "unverified",
-                "verified_at": datetime.now(CST).isoformat(),
-            })
+        text = m.group(2).strip()
+        if 8 <= len(text) <= 300:
+            _add_claim(text, "heuristic_bullet", f"line={i + 1}")
+
+    # Pass 2: sentences (split by 。 or \n\n paragraph breaks)
+    paragraphs = re.split(r"\n{2,}", content)
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        # 跳过纯列表段落（已在 Pass 1 处理）
+        para_idx += 1
+        sents = re.split(r"[。；;]\s*", para)
+        for sent in sents:
+            sent = sent.strip()
+            if len(sent) < 10 or len(sent) > 300:
+                continue
+            # 数字事实
+            if digit_re.search(sent) and len(sent) >= 15:
+                _add_claim(sent, "heuristic" if ext in (".md", ".txt") else "extractor",
+                           f"content paragraph={para_idx}")
+            # 会议关键词
+            elif meeting_kw.search(sent) and len(sent) >= 15:
+                _add_claim(sent, "heuristic_meeting" if ext in (".md", ".txt") else "extractor",
+                           f"content paragraph={para_idx}")
 
     return claims
 

@@ -48,6 +48,9 @@ class LintEngine:
                         "source_id": source_id,
                         "grounded": grounded,
                         "detail": "OK" if grounded else f"source {source_id} 不存在",
+                        "severity": "info" if grounded else "warning",
+                        "category": "claim_grounding",
+                        "confidence": 1.0,
                     })
             except Exception:
                 continue
@@ -86,6 +89,9 @@ class LintEngine:
                                 "source": str(md_file.relative_to(self.workspace)),
                                 "target": target,
                                 "line": i,
+                                "severity": "warning",
+                                "category": "broken_wikilinks",
+                                "confidence": 1.0,
                             })
             except Exception:
                 continue
@@ -137,11 +143,14 @@ class LintEngine:
             has_in = bool(in_links.get(page))
             has_out = bool(out_links.get(page))
             if not has_in and not has_out:
-                orphans.append({"path": page, "reason": "无入链且无出链"})
+                orphans.append({"path": page, "reason": "无入链且无出链",
+                                "severity": "info", "category": "orphan_pages", "confidence": 1.0})
             elif not has_in:
-                orphans.append({"path": page, "reason": "无入链"})
+                orphans.append({"path": page, "reason": "无入链",
+                                "severity": "info", "category": "orphan_pages", "confidence": 1.0})
             elif not has_out:
-                orphans.append({"path": page, "reason": "无出链"})
+                orphans.append({"path": page, "reason": "无出链",
+                                "severity": "info", "category": "orphan_pages", "confidence": 1.0})
 
         return orphans
 
@@ -185,6 +194,9 @@ class LintEngine:
                                 "claim_a": a.get("claim_id"),
                                 "claim_b": b.get("claim_id"),
                                 "reason": f"同 source 但数值不一致: {sorted(common)} vs {sorted(diff)}",
+                                "severity": "warning",
+                                "category": "contradictions",
+                                "confidence": 0.5,
                             })
             except Exception:
                 continue
@@ -231,6 +243,9 @@ class LintEngine:
                             "claim_id": c.get("claim_id"),
                             "source_id": sid,
                             "warning": f"claim 引用 partial 摄入的 source {sid}，数据可能不完整",
+                            "severity": "warning",
+                            "category": "partial_misuse",
+                            "confidence": 1.0,
                         })
             except Exception:
                 continue

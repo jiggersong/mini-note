@@ -123,3 +123,33 @@ ECS 突发性能实例适合低负载场景。
         result = engine.search("   ", scope="shared")
         assert result["ok"] is False
         assert result["error_code"] == "EMPTY_QUESTION"
+
+
+class TestRelevanceNormalization:
+    """BM25 relevance min-max 归一化：rank 越小（越负）越相关 → relevance 越高。"""
+
+    def test_rank_ordering_maps_to_relevance_descending(self):
+        from mini_note.query.engine import _apply_bm25_relevance
+        results = [
+            {"rank": -73.81}, {"rank": -19.67}, {"rank": -5.0}, {"rank": -1.0},
+        ]
+        _apply_bm25_relevance(results)
+        assert results[0]["relevance"] == 1.0
+        assert results[3]["relevance"] == 0.0
+        assert results[0]["relevance"] > results[1]["relevance"] > results[2]["relevance"] > results[3]["relevance"]
+
+    def test_single_result_gets_one(self):
+        from mini_note.query.engine import _apply_bm25_relevance
+        results = [{"rank": -10.0}]
+        _apply_bm25_relevance(results)
+        assert results[0]["relevance"] == 1.0
+
+    def test_all_same_rank_all_one(self):
+        from mini_note.query.engine import _apply_bm25_relevance
+        results = [{"rank": -5.0}, {"rank": -5.0}]
+        _apply_bm25_relevance(results)
+        assert all(r["relevance"] == 1.0 for r in results)
+
+    def test_empty_list_no_error(self):
+        from mini_note.query.engine import _apply_bm25_relevance
+        _apply_bm25_relevance([])
